@@ -1,0 +1,243 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>We0J Console</title>
+<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
+<script src="https://cdn.tailwindcss.com"></script>
+<link rel="stylesheet" href="style.css">
+</head>
+<body class="dark">
+<div id="app" v-cloak class="h-screen flex flex-col text-sm">
+
+  <!-- ======== 顶栏 ======== -->
+  <header class="topbar h-12 shrink-0 flex items-center gap-3 px-3">
+    <span class="font-bold tracking-wide text-emerald-400">We0J</span>
+    <select class="ui-select" v-model="currentId" @change="onPickSession" title="会话">
+      <option v-for="s in sessions" :key="s.id" :value="s.id">{{ s.title }}</option>
+    </select>
+    <select class="ui-select" v-model="model" @change="setModel" title="模型">
+      <option v-for="m in models" :key="m.id" :value="m.id">{{ m.name }}</option>
+    </select>
+    <select class="ui-select" v-model="permissionMode" @change="setPermissionMode" title="权限模式">
+      <option v-for="m in permissionModes" :key="m" :value="m">{{ m }}</option>
+    </select>
+    <span class="status-pill" :class="'st-' + status">
+      <i class="dot"></i>{{ statusText }}
+    </span>
+    <span class="conn" :class="{ on: sseOn }" :title="sseOn ? 'SSE 已连接' : 'SSE 未连接'"></span>
+    <div class="ml-auto flex items-center gap-1">
+      <button v-for="p in panels" :key="p" class="ui-btn" :class="{ active: panel === p }"
+              @click="togglePanel(p)">{{ panelLabels[p] }}</button>
+    </div>
+  </header>
+
+  <div class="flex-1 flex overflow-hidden">
+    <!-- ======== 左侧会话列表 ======== -->
+    <aside class="w-60 shrink-0 border-r border-gray-800 flex flex-col bg-panel">
+      <div class="p-2 flex items-center justify-between">
+        <span class="text-gray-500 uppercase text-xs">Sessions</span>
+        <button class="ui-btn" @click="newSession" title="新建会话">＋ 新建</button>
+      </div>
+      <ul class="flex-1 overflow-y-auto px-2 pb-2 space-y-1">
+        <li v-for="s in sessions" :key="s.id"
+            class="session-item" :class="{ active: s.id === currentId }"
+            @click="selectSession(s.id)">
+          <div class="truncate">{{ s.title }}</div>
+          <div class="text-xs text-gray-500 truncate">{{ s.workdir || s.id }}</div>
+        </li>
+        <li v-if="!sessions.length" class="text-gray-600 p-2">暂无会话</li>
+      </ul>
+    </aside>
+
+    <!-- ======== 中部消息流 + Composer ======== -->
+    <main class="flex-1 flex flex-col min-w-0">
+      <div ref="scroller" class="flex-1 overflow-y-auto px-4 py-3 space-y-3">
+        <div v-if="!currentId" class="text-gray-600 pt-10 text-center">
+          选择或新建一个会话开始。
+        </div>
+        <div v-for="msg in messages" :key="msg.id" :class="msg.role === 'user' ? 'msg-user' : 'msg-assistant'">
+          <div v-if="msg.error" class="part-error">{{ msg.error }}</div>
+          <template v-for="part in msg.parts" :key="part.key">
+            <!-- 文本 -->
+            <div v-if="part.kind === 'text'" class="part-text" :class="msg.role">
+              <span v-if="msg.role === 'user'" class="whitespace-pre-wrap">{{ part.text }}</span>
+              <span v-else class="md" v-html="md(part.text)"></span>
+            </div>
+            <!-- 推理（可折叠暗色块） -->
+            <details v-else-if="part.kind === 'reasoning'" class="part-reasoning">
+              <summary>💭 Reasoning</summary>
+              <div class="whitespace-pre-wrap">{{ part.text }}</div>
+            </details>
+            <!-- 工具卡片 -->
+            <div v-else-if="part.kind === 'tool'" class="part-tool">
+              <details>
+                <summary>
+                  <i class="dot" :class="'tool-' + part.status"></i>
+                  <span class="font-mono text-emerald-300">{{ part.toolName }}</span>
+                  <span class="text-gray-500 truncate flex-1">{{ part.title }}</span>
+                  <span class="text-xs text-gray-600">{{ part.status }}</span>
+                </summary>
+                <div class="tool-body">
+                  <div class="tool-label">input</div>
+                  <pre class="code-block">{{ part.input }}</pre>
+                  <template v-if="part.error != null">
+                    <div class="tool-label err">error</div>
+                    <pre class="code-block err">{{ part.error }}</pre>
+                  </template>
+                  <template v-else-if="part.output != null">
+                    <div class="tool-label">output</div>
+                    <pre class="code-block">{{ part.output }}</pre>
+                  </template>
+                </div>
+              </details>
+            </div>
+            <!-- 用量行 -->
+            <div v-else-if="part.kind === 'step-finish'" class="part-usage">
+              ⏱ {{ part.usage }}
+            </div>
+            <!-- 压缩分隔横幅 -->
+            <div v-else-if="part.kind === 'compaction'" class="part-compaction">
+              ─── 上下文已压缩 (compaction) ───
+            </div>
+            <!-- 其他（file/patch/snapshot/…）占位 -->
+            <div v-else-if="part.kind === 'other'" class="text-xs text-gray-600">
+              [{{ part.type }}]
+            </div>
+          </template>
+        </div>
+      </div>
+
+      <div class="composer shrink-0 border-t border-gray-800 p-3">
+        <div class="flex gap-2 items-end">
+          <textarea ref="input" v-model="draft" rows="3"
+            class="ui-textarea"
+            :placeholder="currentId ? '输入消息… Enter 发送 / Shift+Enter 换行' : '请先选择会话'"
+            @keydown="onKeydown"></textarea>
+          <div class="flex flex-col gap-2">
+            <button class="ui-btn primary" :disabled="!currentId || sending" @click="send">
+              {{ sending ? '…' : '发送' }}
+            </button>
+            <button class="ui-btn danger" :disabled="status !== 'busy'" @click="cancel">停止</button>
+          </div>
+        </div>
+        <div v-if="error" class="text-red-400 text-xs mt-1">{{ error }}</div>
+      </div>
+    </main>
+
+    <!-- ======== 右侧面板抽屉 ======== -->
+    <aside v-if="panel" class="w-80 shrink-0 border-l border-gray-800 bg-panel overflow-y-auto p-3">
+      <div class="flex items-center justify-between mb-3">
+        <span class="uppercase text-xs text-gray-500">{{ panelLabels[panel] }}</span>
+        <button class="ui-btn" @click="panel = null">✕</button>
+      </div>
+
+      <div v-if="panel === 'status'" class="space-y-2">
+        <div class="kv"><b>status</b><span>{{ status }}</span></div>
+        <div class="kv" v-for="(v, k) in statusDetail" :key="k"><b>{{ k }}</b><span>{{ v }}</span></div>
+        <div class="kv"><b>model</b><span>{{ model || '-' }}</span></div>
+        <div class="kv"><b>session</b><span class="font-mono">{{ currentId || '-' }}</span></div>
+        <hr class="border-gray-800">
+        <div class="kv"><b>tokens in</b><span>{{ totals.input }}</span></div>
+        <div class="kv"><b>tokens out</b><span>{{ totals.output }}</span></div>
+        <div class="kv"><b>cost</b><span>{{ totals.cost }}</span></div>
+        <pre v-if="rawStatus" class="code-block mt-2 max-h-64 overflow-auto">{{ rawStatus }}</pre>
+      </div>
+
+      <div v-else-if="panel === 'todos'" class="space-y-2">
+        <div v-for="(t, i) in panelData.todos || []" :key="i" class="todo-item">
+          <i class="dot" :class="'todo-' + String(t.status || '').toLowerCase()"></i>
+          <span :class="{ done: t.status === 'COMPLETED' }">
+            {{ t.status === 'IN_PROGRESS' ? (t.activeForm || t.content) : t.content }}
+          </span>
+        </div>
+        <div v-if="!(panelData.todos || []).length" class="text-gray-600">无 todos</div>
+      </div>
+
+      <div v-else-if="panel === 'tasks'" class="space-y-2">
+        <div v-for="t in panelData.tasks || []" :key="t.id" class="task-card">
+          <div class="flex justify-between">
+            <b>{{ t.subject }}</b><span class="text-xs" :class="'text-' + String(t.status||'').toLowerCase()">{{ t.status }}</span>
+          </div>
+          <div class="text-xs text-gray-500">
+            <span v-if="t.owner">owner: {{ t.owner }}</span>
+            <span v-if="(t.openBlockedBy || []).length"> · blockedBy: {{ t.openBlockedBy.join(', ') }}</span>
+          </div>
+        </div>
+        <div v-if="!(panelData.tasks || []).length" class="text-gray-600">无 tasks</div>
+      </div>
+
+      <div v-else-if="panel === 'tools'" class="space-y-2">
+        <div v-for="tl in panelData.tools || []" :key="tl.name" class="tool-info">
+          <b class="font-mono text-emerald-300">{{ tl.name }}</b>
+          <div class="text-xs text-gray-500">{{ tl.description }}</div>
+        </div>
+        <div v-if="!(panelData.tools || []).length" class="text-gray-600">无工具信息</div>
+      </div>
+
+      <div v-else-if="panel === 'model'" class="space-y-1">
+        <div v-for="m in models" :key="m.id" class="model-item" :class="{ active: m.id === model }"
+             @click="model = m.id; setModel()">
+          <div>{{ m.name }}</div>
+          <div class="text-xs text-gray-500 font-mono">{{ m.provider ? m.provider + '/' : '' }}{{ m.id }}</div>
+        </div>
+      </div>
+    </aside>
+  </div>
+
+  <!-- ======== Permission 弹窗 ======== -->
+  <div v-if="permission" class="overlay">
+    <div class="dialog">
+      <h3 class="text-amber-400 font-bold mb-2">⚠ 权限请求</h3>
+      <div class="mb-2 whitespace-pre-wrap">{{ permission.message || permission.permission }}</div>
+      <div v-if="(permission.patterns || []).length" class="mb-2">
+        <div class="text-xs text-gray-500 mb-1">patterns</div>
+        <pre v-for="p in permission.patterns" :key="p" class="code-block inline-code-block">{{ p }}</pre>
+      </div>
+      <div v-if="(permission.always || []).length" class="mb-2">
+        <label v-for="a in permission.always" :key="a" class="flex items-center gap-2 text-xs">
+          <input type="checkbox" v-model="alwaysPicks"> <span class="font-mono">always: {{ a }}</span>
+        </label>
+      </div>
+      <input class="ui-textarea single" v-model="permissionNote" placeholder="附加说明（拒绝时可填）">
+      <div class="flex gap-2 justify-end mt-3">
+        <button class="ui-btn danger" @click="replyPermission('reject')">拒绝</button>
+        <button class="ui-btn" @click="replyPermission('always')">总是允许</button>
+        <button class="ui-btn primary" @click="replyPermission('once')">本次允许</button>
+      </div>
+    </div>
+  </div>
+
+  <!-- ======== Question 弹窗 ======== -->
+  <div v-if="question" class="overlay">
+    <div class="dialog">
+      <h3 class="text-sky-400 font-bold mb-2">❓ Agent 提问</h3>
+      <div v-for="(q, qi) in question.questions" :key="qi" class="mb-4">
+        <div class="mb-1"><b>{{ q.header || ('Q' + (qi + 1)) }}</b> — {{ q.question }}</div>
+        <template v-if="q.multiSelect">
+          <label v-for="o in q.options" :key="o.label" class="q-option">
+            <input type="checkbox" :value="o.label" v-model="answers[qi]">
+            <span>{{ o.label }}</span><em class="text-xs text-gray-500 not-italic">{{ o.description }}</em>
+          </label>
+        </template>
+        <template v-else>
+          <label v-for="o in q.options" :key="o.label" class="q-option">
+            <input type="radio" :name="'q' + qi" :value="o.label" v-model="answers[qi]">
+            <span>{{ o.label }}</span><em class="text-xs text-gray-500 not-italic">{{ o.description }}</em>
+          </label>
+        </template>
+        <input class="ui-textarea single mt-1" v-model="customs[qi]"
+               :placeholder="q.multiSelect ? '自定义答案（逗号分隔，优先于勾选）' : '或输入自定义答案…'">
+      </div>
+      <div class="flex gap-2 justify-end">
+        <button class="ui-btn" @click="replyQuestion(null)">放弃</button>
+        <button class="ui-btn primary" @click="replyQuestion(answers)">提交</button>
+      </div>
+    </div>
+  </div>
+
+</div>
+<script src="app.js"></script>
+</body>
+</html>

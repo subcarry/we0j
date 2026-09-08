@@ -1,0 +1,44 @@
+# We0J Web 控制台（DDD §5.16.1）
+# ★ 持久化零自动配置：sqlite 数据源 / Flyway / JPA 全部由 RuntimeBootstrap 手工装配
+#   （见 We0jServerApplication 的 exclude 列表），本文件刻意不出现 spring.datasource / flyway 段。
+server:
+  port: ${WE0J_WEB_PORT:8787}
+  address: 127.0.0.1                # 仅 loopback（NFR-04）
+  shutdown: graceful
+  tomcat:
+    threads:
+      max: 200                      # 虚拟线程下仅作连接接受上限
+    max-connections: 2000
+
+spring:
+  threads:
+    virtual:
+      enabled: true                 # MVC 请求走虚拟线程（阻塞式编程模型 + 高并发）
+  main:
+    banner-mode: off
+    lazy-initialization: false      # Bus/Registry 需即时初始化
+  jackson:
+    default-property-inclusion: non_null
+    property-naming-strategy: LOWER_CAMEL_CASE
+    serialization:
+      write-dates-as-timestamps: false   # Instant → ISO-8601（§8.1）
+  mvc:
+    async:
+      request-timeout: -1           # SSE 永不超时
+  web:
+    resources:
+      static-locations: classpath:/static/
+      cache:
+        cachecontrol:
+          max-age: 3600
+
+# 项目根（RuntimeBootstrap 装配根）：--we0j.root=<path>，缺省 user.dir
+we0j:
+  root: ${WE0J_ROOT:}
+
+logging:
+  level:
+    root: INFO
+    com.we0j: INFO
+  pattern:
+    console: "%d{HH:mm:ss.SSS} %highlight(%-5level) [%thread] %cyan(%logger{24}) - %msg%n"
