@@ -181,6 +181,8 @@ public final class ToolExecutor {
                     .output(gates.outputSink(cmd.sessionId(), call.callId()))
                     .model(cmd.model())
                     .mutator(gates.sessionMutator())
+                    .skills(gates.skillLookup(cmd.sessionId()))
+                    .agents(gates.agentSpawner())
                     .build();
 
             // 5) 执行（工具内部自行 askPermission）

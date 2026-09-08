@@ -1,7 +1,15 @@
 package com.we0j.agent.bootstrap;
 
+import com.we0j.agent.context.EnvInfoRenderer;
+import com.we0j.agent.context.HistoryConverter;
+import com.we0j.agent.context.MessageNormalizer;
+import com.we0j.agent.context.PromptBlockCache;
+import com.we0j.agent.context.ReminderInjector;
+import com.we0j.agent.context.ReminderStore;
+import com.we0j.agent.context.SystemPromptAssembler;
 import com.we0j.agent.loop.AgentLoop;
 import com.we0j.agent.loop.AgentLoopFactory;
+import com.we0j.agent.loop.ContextAssembler;
 import com.we0j.agent.session.SessionFacade;
 import com.we0j.agent.session.SessionRegistry;
 import com.we0j.agent.session.SessionService;
@@ -98,6 +106,12 @@ public final class RuntimeBootstrap implements AutoCloseable {
 
     private static final Logger log = LoggerFactory.getLogger(RuntimeBootstrap.class);
 
+    /** 子 Agent 屏蔽工具（防递归 + 防越权，DDD §5.12.4 CHILD_RESTRICTED；Team 未注册，遮蔽无害）。 */
+    static final java.util.Set<String> CHILD_RESTRICTED = java.util.Set.of(
+            com.we0j.common.constant.ToolNames.AGENT,
+            com.we0j.common.constant.ToolNames.TEAM_CREATE,
+            com.we0j.common.constant.ToolNames.TEAM_DELETE);
+
     /** 装配选项（null 字段 = 走生产默认）。 */
     public static final class Options {
         /** 前置注册的 Provider（优先于内置实现命中 supports()）。 */
@@ -131,6 +145,11 @@ public final class RuntimeBootstrap implements AutoCloseable {
     private final ToolRegistry toolRegistry;
     private final ToolResolver toolResolver;
     private final ToolExecutor toolExecutor;
+    private final com.we0j.agent.skill.SkillService skillService;
+    private final com.we0j.agent.background.NotificationService notifications;
+    private final com.we0j.agent.background.BackgroundTaskManager background;
+    private final com.we0j.agent.background.ShellManager shellManager;
+    private final com.we0j.agent.agentdef.AgentRegistry agentRegistry;
 
     private RuntimeBootstrap(Path projectRoot, PathResolver resolver, DataSource dataSource,
                              JdbcTemplate jdbc, EntityManagerFactory emf, TransactionTemplate tx,
@@ -140,7 +159,12 @@ public final class RuntimeBootstrap implements AutoCloseable {
                              ModelCardManager cards, ModelClient modelClient, ExecutorService loopExecutor,
                              ToolRegistry toolRegistry, ToolResolver toolResolver,
                              ToolExecutor toolExecutor,
-                             com.we0j.agent.compaction.CompactionService compactionService) {
+                             com.we0j.agent.compaction.CompactionService compactionService,
+                             com.we0j.agent.skill.SkillService skillService,
+                             com.we0j.agent.background.NotificationService notifications,
+                             com.we0j.agent.background.BackgroundTaskManager background,
+                             com.we0j.agent.background.ShellManager shellManager,
+                             com.we0j.agent.agentdef.AgentRegistry agentRegistry) {
         this.projectRoot = projectRoot;
         this.resolver = resolver;
         this.dataSource = dataSource;
@@ -162,6 +186,11 @@ public final class RuntimeBootstrap implements AutoCloseable {
         this.toolRegistry = toolRegistry;
         this.toolResolver = toolResolver;
         this.toolExecutor = toolExecutor;
+        this.skillService = skillService;
+        this.notifications = notifications;
+        this.background = background;
+        this.shellManager = shellManager;
+        this.agentRegistry = agentRegistry;
     }
 
     public static RuntimeBootstrap init(Path projectRoot) {
@@ -241,6 +270,22 @@ public final class RuntimeBootstrap implements AutoCloseable {
         JsonFileStore fileStore = new JsonFileStore(new FileLocks());
         CostCalculator costCalculator = new CostCalculator();
 
+        // ── Skills 子系统（M4，DDD §5.11 / FR-080）─────────────────────────────
+        // 分层扫描（global → project）+ 热加载双轨；disable 经 settings.code.disabledSkills 热生效。
+        com.we0j.agent.skill.SkillService skillService = new com.we0j.agent.skill.SkillService(
+                new com.we0j.agent.skill.SkillScanner(),
+                () -> {
+                    Settings s = settingsStore.current(root);
+                    return s != null && s.code() != null && s.code().disabledSkills() != null
+                            ? s.code().disabledSkills() : List.of();
+                });
+        try {
+            skillService.refresh(root);
+            skillService.startWatcher(root);
+        } catch (RuntimeException e) {
+            log.warn("skills init degraded (scan/watch failed): {}", e.toString());
+        }
+
         // ── 会话层 ──────────────────────────────────────────────────────────
         SessionStateCache cache = new SessionStateCache();
         SessionRegistry registry = new SessionRegistry();
@@ -310,6 +355,26 @@ public final class RuntimeBootstrap implements AutoCloseable {
         com.we0j.tool.builtin.shell.ShellExecutor shellExecutor =
                 new com.we0j.tool.builtin.shell.ShellExecutor();
 
+        // ── M6 后台任务与通知回流装配（DDD §5.12/§5.14）─────────────────────
+        // 装配环拆解：NotificationService 经 facadeRef 迟到取 SessionFacade；BackgroundTaskManager
+        // 经 launcherRef 迟到取子 Loop 启动器（launcher 闭包依赖 loopFactoryFor/toolExecutor）；
+        // AgentSpawner 经 spawnerRef 迟到注入 GateProvider（toolBeans 在其后构造）。
+        java.util.concurrent.atomic.AtomicReference<SessionFacade> facadeRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<com.we0j.agent.background.ChildLoopLauncher> launcherRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        java.util.concurrent.atomic.AtomicReference<com.we0j.tool.spi.AgentSpawner> spawnerRef =
+                new java.util.concurrent.atomic.AtomicReference<>();
+        com.we0j.agent.background.NotificationService notifications =
+                new com.we0j.agent.background.NotificationService(registry, bus, facadeRef::get);
+        com.we0j.agent.background.BackgroundTaskManager background =
+                new com.we0j.agent.background.BackgroundTaskManager(bus, notifications, sessions,
+                        shellExecutor, launcherRef::get);
+        com.we0j.agent.agentdef.AgentRegistry agentRegistry =
+                new com.we0j.agent.agentdef.AgentRegistry(root);
+        com.we0j.agent.background.ShellManager shellManager =
+                new com.we0j.agent.background.ShellManager(background, resolver);
+
         List<Tool> toolBeans = java.util.List.of(
                 new com.we0j.tool.builtin.file.ReadTool(fileTime, lsp),
                 new com.we0j.tool.builtin.file.WriteTool(fileTime, lsp, atomicWriter),
@@ -323,7 +388,13 @@ public final class RuntimeBootstrap implements AutoCloseable {
                 new com.we0j.tool.builtin.mode.EnterPlanModeTool(),
                 new com.we0j.tool.builtin.mode.ExitPlanModeTool(),
                 new com.we0j.tool.builtin.mode.EnterWorktreeTool(),
-                new com.we0j.tool.builtin.mode.ExitWorktreeTool());
+                new com.we0j.tool.builtin.mode.ExitWorktreeTool(),
+                // M4（FR-080）：SKILL 加载入口（常驻；卡片查找/记账经 GateProvider.skillLookup 缝）
+                new com.we0j.tool.builtin.skill.SkillTool(skillService.expander()),
+                // M6（FR-079/FR-152/FR-154）：子 Agent 派生 + 后台任务查状态/终止（§5.12.4）
+                new com.we0j.tool.builtin.agent.AgentTool(),
+                new com.we0j.tool.builtin.agent.TaskOutputTool(background),
+                new com.we0j.tool.builtin.agent.TaskStopTool(background));
         ToolRegistry toolRegistry = new ToolRegistry(toolBeans, schemas);
         OverlayStore toolOverlays = new OverlayStore();
         // 激活态读写缝：挂 SessionStateCache/Sessions 的 runtimeState.activatedDeferredTools（FR-065/FR-013）。
@@ -382,6 +453,34 @@ public final class RuntimeBootstrap implements AutoCloseable {
                 // FR-081/FR-082 工具缝：cache 权威副本 + session.runtime_state 落盘（FR-013 resume 完整）。
                 return (sid, op) -> sessions.updateRuntimeState(sid, op);
             }
+
+            @Override
+            public com.we0j.tool.spi.SkillLookup skillLookup(String sessionId) {
+                // FR-080 工具缝：SKILL 卡片读 SkillService 快照；invokedSkills 落 RuntimeState（压缩后恢复）。
+                return new com.we0j.tool.spi.SkillLookup() {
+                    @Override
+                    public java.util.Optional<com.we0j.common.domain.skill.SkillCard> find(String name) {
+                        return skillService.find(name);
+                    }
+
+                    @Override
+                    public List<String> names() {
+                        return skillService.names();
+                    }
+
+                    @Override
+                    public void recordInvoked(String sid, String name) {
+                        sessions.updateRuntimeState(sid, rt -> rt.plusInvokedSkill(name));
+                    }
+                };
+            }
+
+            @Override
+            public com.we0j.tool.spi.AgentSpawner agentSpawner() {
+                // FR-079 工具缝：AgentTool 经 ToolContext.agents 触达；spawnerRef 迟到接线
+                //（装配环：spawner 依赖 toolExecutor/loopFactory，晚于本匿名类创建）。
+                return spawnerRef.get();
+            }
         };
         // SessionSink：状态回写经 SessionService（cache 权威副本 + 节流落库 + Bus part.updated）。
         SessionSink sessionSink = (sid, partId, state) -> {
@@ -430,18 +529,61 @@ public final class RuntimeBootstrap implements AutoCloseable {
                         },
                         tokenCounter, bus, settingsStore, cards);
 
-        AgentLoopFactory loopFactory = (sid, entry) -> new AgentLoop(sid, entry,
-                new AgentLoop.Deps(sessions, cache, bus, registry, card, modelClient, costCalculator,
-                        retry, settings, null, maxSteps, toolExecutor, toolResolver,
-                        snapshotService, compactionService));
+        // ── M4 skills 接线：带 SkillService 的贡献者链（SkillsContributor 真实渲染 + reminder 注入点
+        // drain 热加载）。其余行为与 AgentLoop 默认 new ContextAssembler() 一致（NOOP 落库缝）。
+        // M6：background_notification 位换注入 NotificationService 的真实 drain 渲染（FR-153）。
+        List<com.we0j.agent.context.ContextContributor> contributors = new ArrayList<>();
+        for (com.we0j.agent.context.ContextContributor c
+                : ContextAssembler.defaultContributors(skillService)) {
+            contributors.add("background_notification".equals(c.source())
+                    ? new com.we0j.agent.context.contributors.BackgroundNotificationContributor(notifications)
+                    : c);
+        }
+        ContextAssembler contextAssembler = new ContextAssembler(
+                new SystemPromptAssembler(new PromptBlockCache(), new EnvInfoRenderer()),
+                new ReminderInjector(contributors, ReminderStore.NOOP),
+                new HistoryConverter(new MessageNormalizer()),
+                root,
+                sid -> cache.has(sid) ? cache.runtimeState(sid).agentName() : null,
+                List::of, List::of);
+
+        // 子 Loop 工厂模板：主 Loop（card/maxSteps）与子 Agent Loop（per-child card/maxTurns）共用；
+        // 子 facade 与主 facade 共享 registry → 同会话互斥不破。
+        java.util.function.BiFunction<ModelCard, Integer, AgentLoopFactory> loopFactoryFor =
+                (loopCard, loopSteps) -> (sid, entry) -> new AgentLoop(sid, entry,
+                        new AgentLoop.Deps(sessions, cache, bus, registry, loopCard, modelClient,
+                                costCalculator, retry, settings, contextAssembler, loopSteps,
+                                toolExecutor, toolResolver, snapshotService, compactionService));
         ExecutorService loopExecutor = VirtualThreadExecutors.io("we0j-loop-");
-        SessionFacade facade = new SessionFacade(sessions, registry, loopFactory, loopExecutor);
+        SessionFacade facade = new SessionFacade(sessions, registry,
+                loopFactoryFor.apply(card, maxSteps), loopExecutor);
+        facadeRef.set(facade);
+
+        // ── M6 迟到接线：子 Loop 启动器（§5.12.1 ChildLoopLauncher = 子专用 facade 循环）───
+        launcherRef.set((childSid, promptText, modelRefStr, maxTurns, abort) -> {
+            ModelCard childCard = defaultCardFor(cards, root, card, modelRefStr);
+            int steps = maxTurns == null || maxTurns <= 0 ? maxSteps : maxTurns;
+            SessionFacade childFacade = new SessionFacade(sessions, registry,
+                    loopFactoryFor.apply(childCard, steps));
+            java.util.concurrent.CompletableFuture<com.we0j.agent.loop.LoopOutcome> fut =
+                    childFacade.prompt(new SessionFacade.PromptInput(childSid, promptText, List.of(),
+                            com.we0j.common.domain.message.ChannelSource.SUBAGENT, null, null));
+            if (abort != null) {
+                abort.onCancel(() -> childFacade.cancel(childSid));     // 父 abort 级联子 Loop（FR-154）
+            }
+            return fut.get(2, java.util.concurrent.TimeUnit.HOURS);
+        });
+
+        // ── M6 迟到接线：AgentSpawner（AgentTool 经 ToolContext.agents 触达，§5.12.4）───
+        spawnerRef.set(spawnRequest(agentRegistry, sessions, toolOverlays, cache,
+                background, cards, resolver, root, card));
 
         log.info("we0j runtime ready root={} db={} projectId={}", root, resolver.runtimeDbPath(),
                 resolver.projectId());
         return new RuntimeBootstrap(root, resolver, ds, jdbc, emf, tx, bus, settingsStore, fileStore,
                 throttler, cache, registry, sessions, facade, cards, modelClient, loopExecutor,
-                toolRegistry, toolResolver, toolExecutor, compactionService);
+                toolRegistry, toolResolver, toolExecutor, compactionService, skillService,
+                notifications, background, shellManager, agentRegistry);
     }
 
     // ── getters（CLI 消费面）──────────────────────────────────────────────────
@@ -467,6 +609,16 @@ public final class RuntimeBootstrap implements AutoCloseable {
     /** M3 压缩服务（CLI /compact 消费面；AgentLoop 空闲微压缩同源）。 */
     public com.we0j.agent.compaction.CompactionService compactionService() { return compactionService; }
 
+    /** M4 Skills 子系统（CLI /skills 与 ContextAssembler 接线消费面）。 */
+    public com.we0j.agent.skill.SkillService skillService() { return skillService; }
+
+    /** M6 后台任务与通知回流消费面（§5.12；TaskOutput/测试/CLI 直接查状态）。 */
+    public com.we0j.agent.background.NotificationService notifications() { return notifications; }
+    public com.we0j.agent.background.BackgroundTaskManager background() { return background; }
+    public com.we0j.agent.background.ShellManager shellManager() { return shellManager; }
+    /** M6 Agent 人格注册表（§5.14；/agents 命令与 AgentTool 同源）。 */
+    public com.we0j.agent.agentdef.AgentRegistry agentRegistry() { return agentRegistry; }
+
     /** 直接读行（诊断 / 测试断言用）。 */
     public List<MessageRow> messageRows(String sessionId) {
         return tx.execute(s -> sessions.messageRows(sessionId));
@@ -476,9 +628,14 @@ public final class RuntimeBootstrap implements AutoCloseable {
         return tx.execute(s -> sessions.partRows(sessionId));
     }
 
-    /** 优雅关闭：abort 在跑 Loop → executor → throttler（flushAll）→ Bus → JPA。 */
+    /** 优雅关闭：静默后台任务 → abort 在跑 Loop → executor → throttler（flushAll）→ Bus → JPA。 */
     @Override
     public void close() {
+        try {
+            background.shutdown();                     // M6：abort 在跑子 Agent/Shell（不回流通知）
+        } catch (RuntimeException e) {
+            log.warn("background shutdown degraded: {}", e.toString());
+        }
         for (SessionRegistry.SessionEntry e : registry.all()) {
             e.abortSignal().abort();
         }
@@ -498,6 +655,11 @@ public final class RuntimeBootstrap implements AutoCloseable {
         }
         bus.shutdown();
         try {
+            skillService.stopWatcher();              // M4：停 skills 热加载监视线程
+        } catch (RuntimeException e) {
+            log.warn("skill watcher stop failed: {}", e.toString());
+        }
+        try {
             emf.close();
         } catch (RuntimeException e) {
             log.warn("emf close failed: {}", e.toString());
@@ -510,6 +672,128 @@ public final class RuntimeBootstrap implements AutoCloseable {
             return s.common().chat().defaultModel();
         }
         return new Settings.ModelRef("anthropic", "claude-sonnet-4-5");
+    }
+
+    /** 子 Loop 模型卡：显式 {@code provider/model} 命中配置则用之，否则回退主会话卡（§5.12.4 步骤 6）。 */
+    private static ModelCard defaultCardFor(ModelCardManager cards, Path root, ModelCard fallback,
+                                            String modelRef) {
+        if (modelRef != null && modelRef.contains("/")) {
+            String[] pm = modelRef.split("/", 2);
+            var hit = cards.resolve(root, new Settings.ModelRef(pm[0], pm[1]));
+            if (hit.isPresent()) {
+                return hit.get();
+            }
+        }
+        return fallback;
+    }
+
+    /**
+     * AgentSpawner 实现缝（§5.12.4 完整链路）：解析人格 → create 子 Session（parentId=父）→
+     * overlay 屏蔽 Agent/Team + 人格工具白名单拦截 → 子运行时拒绝再派生（AGENT DENY）+
+     * 继承父权限模式 → BackgroundTaskManager.startAgent；前台同步等终态后回子会话最后
+     * assistant 文本，后台立返 agent_id + output_file（完成时通知回流，FR-153）。
+     */
+    private static com.we0j.tool.spi.AgentSpawner spawnRequest(
+            com.we0j.agent.agentdef.AgentRegistry agents,
+            SessionService sessions,
+            OverlayStore overlays,
+            SessionStateCache cache,
+            com.we0j.agent.background.BackgroundTaskManager background,
+            ModelCardManager cards,
+            PathResolver resolver,
+            Path root,
+            ModelCard defaultCard) {
+        return req -> {
+            com.we0j.common.domain.agent.AgentInfo agent = agents.resolve(req.subagentType())
+                    .orElseThrow(() -> new ToolException("Unknown subagent_type '%s'. Available: %s"
+                            .formatted(req.subagentType(), String.join(", ", agents.names()))));
+
+            // 子 Session：workdir 继承父会话（root 级别；worktree 切换随后续里程碑下钻到 session 行）
+            String childId = sessions.create(root, req.sessionId(), agent.name()).getId();
+
+            // 工具 overlay：防递归/防越权（§5.12.4 CHILD_RESTRICTED）+ 人格白名单执行拦截
+            overlays.put(childId, new com.we0j.tool.registry.SessionToolOverlay(
+                    CHILD_RESTRICTED, List.of(),
+                    agent.tools().isEmpty() ? null : (toolName, ignoredInput, ignoredCallId) ->
+                            agent.tools().contains(toolName) ? java.util.Optional.empty()
+                                    : java.util.Optional.of("Tool '" + toolName + "' is not available "
+                                            + "to subagent '" + agent.name() + "'.")));
+
+            // 子 Agent 运行时权限：不得再派生（AGENT DENY）；权限模式继承父会话
+            com.we0j.common.domain.permission.PermissionMode parentMode =
+                    cache.has(req.sessionId()) ? cache.runtimeState(req.sessionId()).permissionMode()
+                            : null;
+            sessions.updateRuntimeState(childId, rt -> {
+                var next = rt.plusRuntimeRules(List.of(
+                        new com.we0j.common.domain.permission.PermissionRule(
+                                PermissionName.AGENT, "*", Action.DENY)));
+                return parentMode == null ? next : next.withPermissionMode(parentMode);
+            });
+
+            // 模型选择：显式 > 人格 tier > 默认卡（tier 回写 qualifiedId 供 launcher 解析）
+            String modelRef = req.model() != null ? req.model()
+                    : agent.modelTier() == null ? null
+                            : cards.resolveTier(root, agent.modelTier())
+                                    .map(ModelCard::qualifiedId).orElse(null);
+            java.nio.file.Path outputFile = resolver.agentOutputFile(childId);
+
+            com.we0j.common.domain.notification.BackgroundTask task = background.startAgent(
+                    com.we0j.agent.background.StartAgentCommand.builder()
+                            .childSessionId(childId)
+                            .parentSessionId(req.sessionId())
+                            .agentName(agent.name())
+                            .prompt(req.prompt())
+                            .modelRef(modelRef)
+                            .maxTurns(req.maxTurns())
+                            .outputFile(outputFile)
+                            .description(req.description() == null ? agent.name() : req.description())
+                            .parentAbort(req.abort())
+                            .notifyParent(req.background())      // 前台父在同步等待，不回流
+                            .build());
+
+            if (req.background()) {
+                return com.we0j.tool.spi.ToolResult.text("""
+                        Started background agent.
+                        agent_id: %s
+                        description: %s
+                        output_file: %s
+
+                        It runs in an isolated context window and you will be notified automatically \
+                        when it completes. Meanwhile, continue with other work — do NOT poll or sleep.
+                        Use TaskOutput(taskId="%s", block=false) to peek at progress, \
+                        TaskStop(taskId="%s") to terminate."""
+                        .formatted(childId, req.description(), outputFile, childId, childId));
+            }
+
+            // 前台：同步等终态；父 abort 已由 manager 级联（entry.abort = parent.child()）
+            com.we0j.common.domain.notification.BackgroundTask done;
+            try {
+                done = background.completionOf(task.id())
+                        .get(2, java.util.concurrent.TimeUnit.HOURS);
+            } catch (java.util.concurrent.TimeoutException e) {
+                background.cancel(task.id());
+                throw new ToolException("Subagent '" + childId + "' timed out after 2h and was stopped.");
+            } catch (InterruptedException e) {
+                Thread.currentThread().interrupt();
+                background.cancel(task.id());
+                throw new com.we0j.common.exception.AbortedException("subagent wait interrupted");
+            } catch (java.util.concurrent.ExecutionException e) {
+                done = background.find(task.id()).orElse(task);
+            }
+            String text = sessions.lastAssistantText(childId);
+            String assistant = """
+                    Subagent '%s' finished (%s).
+
+                    Result:
+                    %s
+
+                    Full transcript: %s"""
+                    .formatted(agent.name(), done.status().wire(),
+                            text.isBlank() ? "(no text output)" : text, outputFile);
+            return com.we0j.tool.spi.ToolResult.of(assistant, null,
+                    java.util.Map.of("agentId", childId, "status", done.status().name(),
+                            "outputFile", outputFile.toString()));
+        };
     }
 
     private static int loopMaxSteps(Settings s) {

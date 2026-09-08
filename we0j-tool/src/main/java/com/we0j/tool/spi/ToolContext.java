@@ -21,7 +21,18 @@ public record ToolContext(
         QuestionGate questions,
         ToolOutputSink output,
         com.we0j.llm.spi.ModelCard model,
-        SessionMutator mutator) {
+        SessionMutator mutator,
+        SkillLookup skills,
+        AgentSpawner agents) {
+
+    /** 子 Agent 派生缝（FR-079，§5.12.4）；未接线 → ToolException（由 ToolExecutor 收敛为 ERROR）。 */
+    public AgentSpawner agentsOrThrow() {
+        if (agents == null) {
+            throw new com.we0j.common.exception.ToolException(
+                    "Agent spawning is not wired in this build.");
+        }
+        return agents;
+    }
 
     /** 阻塞请求权限；每个阻塞点前 throwIfAborted 由 Loop 保证（FR-024）。 */
     public void askPermission(PermissionName name, java.util.List<String> patterns, String message,
@@ -44,6 +55,8 @@ public record ToolContext(
         private ToolOutputSink output;
         private com.we0j.llm.spi.ModelCard model;
         private SessionMutator mutator = SessionMutator.NOOP;
+        private SkillLookup skills = SkillLookup.NOOP;
+        private AgentSpawner agents;
 
         public Builder sessionId(String v) { this.sessionId = v; return this; }
         public Builder messageId(String v) { this.messageId = v; return this; }
@@ -58,11 +71,17 @@ public record ToolContext(
         public Builder model(com.we0j.llm.spi.ModelCard v) { this.model = v; return this; }
         /** 会话 RuntimeState 演进缝（FR-081/FR-082）；null → NOOP。 */
         public Builder mutator(SessionMutator v) { this.mutator = v == null ? SessionMutator.NOOP : v; return this; }
+        /** SKILL 工具查询缝（DDD §5.11，FR-080：find + recordInvoked）；null → NOOP。 */
+        public Builder skills(SkillLookup v) { this.skills = v == null ? SkillLookup.NOOP : v; return this; }
+        /** 子 Agent 派生缝（GateProvider.agentSpawner()，FR-079）。 */
+        public Builder agents(AgentSpawner v) { this.agents = v; return this; }
 
         public ToolContext build() {
             return new ToolContext(sessionId, messageId, callId, abort, workdir, lane,
                     settings, gate, questions, output, model,
-                    mutator == null ? SessionMutator.NOOP : mutator);
+                    mutator == null ? SessionMutator.NOOP : mutator,
+                    skills == null ? SkillLookup.NOOP : skills,
+                    agents);
         }
     }
 }

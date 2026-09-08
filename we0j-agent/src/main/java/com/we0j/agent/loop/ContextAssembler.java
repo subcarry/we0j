@@ -95,9 +95,15 @@ public final class ContextAssembler {
 
     /** DDD §5.4.2 表格的 9 个默认贡献者（bootstrap 可用自维护列表覆盖）。 */
     public static List<ContextContributor> defaultContributors() {
+        return defaultContributors(null);
+    }
+
+    /** M4 skills 接线版：SkillsContributor 注入 {@link com.we0j.agent.skill.SkillService}（null → 占位回退 ctx.skills()）。 */
+    public static List<ContextContributor> defaultContributors(
+            com.we0j.agent.skill.SkillService skillService) {
         return List.of(new AgentsMdContributor(), new MemoryPrefixContributor(),
                 new DeferredToolsContributor(), new McpInstructionsContributor(),
-                new BackgroundNotificationContributor(), new SkillsContributor(),
+                new BackgroundNotificationContributor(), new SkillsContributor(skillService),
                 new FollowUpInputContributor(), new PlanModeContributor(), new TeamContextContributor());
     }
 

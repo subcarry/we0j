@@ -80,4 +80,13 @@ public record RuntimeState(
         if (newlyActivated != null) set.addAll(newlyActivated);
         return withActivatedDeferredTools(set);
     }
+
+    /** 追加已调用 skill（去重保序，FR-080：压缩后恢复已加载态的生命周期账本）。 */
+    public RuntimeState plusInvokedSkill(String name) {
+        if (name == null || name.isBlank() || invokedSkills.contains(name)) return this;
+        List<String> merged = new ArrayList<>(invokedSkills);
+        merged.add(name);
+        return new RuntimeState(agentName, permissionMode, runtimePermissionRules, activatedDeferredTools,
+                List.copyOf(merged), lastModelRef, pendingRevert, extra);
+    }
 }

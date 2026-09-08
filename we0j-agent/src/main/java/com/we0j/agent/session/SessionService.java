@@ -349,6 +349,34 @@ public final class SessionService {
         return cache.history(sessionId);
     }
 
+    /**
+     * 子 Agent 结果回读（§5.12.4 lastAssistantText）：最后一条 assistant 消息的非 synthetic
+     * TextPart 拼接；无历史 / 无 assistant 消息 → 空串（不抛）。
+     */
+    public String lastAssistantText(String sessionId) {
+        String text = cache.lastAssistant(sessionId)
+                .map(a -> {
+                    StringBuilder sb = new StringBuilder();
+                    for (Part p : cache.partsOfMessage(sessionId, a.id())) {
+                        if (p instanceof TextPart tp && !Boolean.TRUE.equals(tp.synthetic())) {
+                            sb.append(tp.text() == null ? "" : tp.text());
+                        }
+                    }
+                    return sb.toString();
+                })
+                .orElse("");
+        if (!text.isEmpty() || !cache.has(sessionId)) {
+            return text;
+        }
+        // cache 无该会话（跨进程 resume 等）：先 restore 再取（失败不抛，回空串）
+        try {
+            restore(sessionId);
+            return lastAssistantText(sessionId);
+        } catch (RuntimeException e) {
+            return "";
+        }
+    }
+
     public Optional<Part> part(String partId) {
         return cache.part(partId);
     }
