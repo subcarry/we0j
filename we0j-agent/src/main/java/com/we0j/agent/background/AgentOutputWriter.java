@@ -85,15 +85,20 @@ public final class AgentOutputWriter implements AutoCloseable {
     private void writeLoop() {
         try (BufferedWriter w = Files.newBufferedWriter(file,
                 StandardOpenOption.CREATE, StandardOpenOption.WRITE, StandardOpenOption.APPEND)) {
+            long bytesWritten = 0;
             while (!closed || !queue.isEmpty()) {
                 String line = queue.poll(200, TimeUnit.MILLISECONDS);
                 if (line == null) {
                     continue;
                 }
+                byte[] bytes = line.getBytes(java.nio.charset.StandardCharsets.UTF_8);
                 w.write(line);
                 w.newLine();
                 w.flush();
-                if (Files.size(file) > LIMIT_BYTES) {
+                bytesWritten += bytes.length + 1;
+                // ★ 用内存计数器而非 Files.size()：Windows 下 APPEND 打开的文件
+                //   目录元数据滞后，size 可能读到旧值导致截断哨兵永不触发。
+                if (bytesWritten > LIMIT_BYTES) {
                     w.write("{\"type\":\"truncated\",\"reason\":\"output exceeded 10MB\"}");
                     w.newLine();
                     w.flush();

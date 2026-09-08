@@ -45,8 +45,6 @@ class AgentOutputWriterTest {
 
     // ── JSONL append + 会话过滤 + toolCalls 计数 ────────────────────────────
     @Test
-    @org.junit.jupiter.api.Disabled("确定性失败：ToolPart/CHILD-sentinel 两次 offer 丢失（2/5 行）。"
-            + "根因待查：Bus 分片回调→writer.offer 链路对 ToolPart 序列化或分片派发有损。TODO(M7-followup)")
     void appendsChildEventsAsJsonlAndIgnoresOtherSessions(@TempDir Path dir) throws Exception {
         Path file = dir.resolve("agents/child-01.output");
         AgentOutputWriter writer = new AgentOutputWriter(file, CHILD, bus);
@@ -82,7 +80,6 @@ class AgentOutputWriterTest {
 
     // ── 10MB 截断哨兵 ───────────────────────────────────────────────────────
     @Test
-    @org.junit.jupiter.api.Disabled("同上根因：单 part 行后写线程停摆，truncated 哨兵未写。TODO(M7-followup)")
     void truncatesAfterTenMegabytes(@TempDir Path dir) throws Exception {
         Path file = dir.resolve("child-big.output");
         AgentOutputWriter writer = new AgentOutputWriter(file, CHILD, bus);
