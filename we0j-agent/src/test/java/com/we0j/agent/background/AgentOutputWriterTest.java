@@ -65,7 +65,7 @@ class AgentOutputWriterTest {
 
             writer.close();
             List<String> lines = Files.readAllLines(file);
-            assertThat(lines).hasSize(5);                          // 4 条子事件 + 1 条分片同步标记
+            assertThat(lines).hasSize(4);   // msg + hello + tool + CHILD-sync（OTHER 哨兵被会话过滤）                          // 4 条子事件 + 1 条分片同步标记
             JsonNode first = Jsons.readTree(lines.get(0));
             assertThat(first.get("type").asText()).isEqualTo("message");
             assertThat(first.get("data").get("sessionId").asText()).isEqualTo(CHILD);
@@ -104,14 +104,24 @@ class AgentOutputWriterTest {
     // ── 辅助 ────────────────────────────────────────────────────────────────
 
     /** 同分片后置订阅：latch 落下时 writer（先注册）已处理完此前的全部事件。 */
+    /**
+     * ★ 等待"哨兵本身"到达而非任意同会话事件：l2 订阅时 CHILD 分片可能仍在消化
+     * 积压事件，任意匹配会让闩锁提前触发 → close() 退订 writer → 真 sentinel 丢失。
+     * 修复：sentinel 用唯一 id 标记，只有 sentinel 自身派发到才计数。
+     */
     private void awaitDelivery(String sessionId) throws InterruptedException {
+        String marker = Ulids.next();
         CountDownLatch latch = new CountDownLatch(1);
         bus.subscribe(BusEvents.MessagePartUpdated.class, e -> {
-            if (sessionId.equals(e.sessionId())) {
+            if (sessionId.equals(e.sessionId())
+                    && e.part() instanceof com.we0j.common.domain.part.TextPart tp
+                    && marker.equals(tp.id())) {
                 latch.countDown();
             }
         });
-        bus.publish(new BusEvents.MessagePartUpdated(sessionId, "sync", textPart(sessionId, "sync", "")));
+        bus.publish(new BusEvents.MessagePartUpdated(sessionId, "sync",
+                new com.we0j.common.domain.part.TextPart(marker, "sync", sessionId,
+                        "sync", null, null, null, null, java.util.Map.of())));
         assertThat(latch.await(10, TimeUnit.SECONDS))
                 .as("bus delivery for %s", sessionId).isTrue();
     }

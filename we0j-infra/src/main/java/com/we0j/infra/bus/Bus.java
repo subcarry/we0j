@@ -65,6 +65,10 @@ public final class Bus {
     public <E extends BusEvent> Subscription subscribe(Class<E> type, Consumer<E> handler) {
         TypedSubscription sub = new TypedSubscription(type, handler);
         typed.computeIfAbsent(type, k -> new CopyOnWriteArrayList<>()).add(sub);
+        if (System.getProperty("we0j.busProbe") != null) {
+            System.out.println("[BUS-subscribe] " + type.getSimpleName() + " -> list size "
+                    + typed.get(type).size() + " @ " + System.nanoTime());
+        }
         return () -> {
             CopyOnWriteArrayList<TypedSubscription> list = typed.get(type);
             if (list != null) {
@@ -106,8 +110,14 @@ public final class Bus {
     }
 
     private void dispatchNow(BusEvent event) {
-        for (TypedSubscription s : subscribersOf(event.getClass())) {
+        var subs = subscribersOf(event.getClass());
+        if (System.getProperty("we0j.busProbe") != null) {
+            System.out.println("[BUS-dispatch] topic=" + event.topic() + " seq=" + event.seq()
+                    + " sid=" + event.sessionId() + " subscribers=" + subs.size());
+        }
+        for (TypedSubscription s : subs) {
             try {
+                System.out.println("[BUS-to] " + s.type().getSimpleName() + " @" + System.nanoTime());
                 s.accept(event);
             } catch (Exception e) {
                 log.error("bus subscriber failed topic={}", event.topic(), e);

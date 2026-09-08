@@ -150,6 +150,7 @@ class AgentToolTest {
                     "description", "report writer"));
             fake.scriptText("ack");     // 父收尾 或 子回复（顺序不定，内容一致）
             fake.scriptText("ack");     // 另一条也拿到同一文本
+            fake.scriptText("ack");     // 缓冲：父会话被通知唤醒后的轮次（FR-153）
 
             LoopOutcome out = prompt(bs, parent, "go background");
             assertThat(out.reason()).isEqualTo(LoopExitReason.COMPLETED_REPLY);

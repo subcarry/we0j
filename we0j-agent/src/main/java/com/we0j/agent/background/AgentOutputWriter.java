@@ -74,6 +74,8 @@ public final class AgentOutputWriter implements AutoCloseable {
             if (!childSessionId.equals(e.sessionId())) {
                 return;
             }
+            System.out.println("[PROBE-offer] part type=" + e.part().getClass().getSimpleName()
+                    + " qsize=" + queue.size());
             offer(line("part", e.part()));
             if (e.part() instanceof ToolPart tp && tp.state() instanceof ToolState.Completed) {
                 toolCalls.incrementAndGet();
@@ -96,6 +98,7 @@ public final class AgentOutputWriter implements AutoCloseable {
                 w.newLine();
                 w.flush();
                 bytesWritten += bytes.length + 1;
+                System.out.println("[PROBE-wrote] " + line.substring(0, Math.min(60, line.length())));
                 // ★ 用内存计数器而非 Files.size()：Windows 下 APPEND 打开的文件
                 //   目录元数据滞后，size 可能读到旧值导致截断哨兵永不触发。
                 if (bytesWritten > LIMIT_BYTES) {
