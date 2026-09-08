@@ -42,6 +42,9 @@ public final class HeadlessRunner {
             } else {
                 sessionId = bs.sessions().create(workdir, null, null).getId();
             }
+            // headless 无人值守：权限默认 BYPASS（有 UI 的场景不应使用此路径）。
+            bs.sessions().updateRuntimeState(sessionId,
+                    rt -> rt.withPermissionMode(com.we0j.common.domain.permission.PermissionMode.BYPASS));
 
             var future = bs.facade().prompt(new SessionFacade.PromptInput(
                     sessionId, prompt, List.of(), ChannelSource.HEADLESS, null, null));

@@ -138,7 +138,11 @@ public final class ToolResolver {
                     && !ToolNames.TOOL_SEARCH.equals(d.name())) {
                 deferredNames.add(d.name());
             } else {
-                emitted.add(lazy && activated.contains(d.name()) ? d.withDeferLoading(false) : d);
+                // ★ 不支持 DEFER_LOADING 的模型卡必须以 deferLoading=false 下发——
+                //   否则 OpenAI Chat Provider 会把带标记的工具全部跳过（FR-065 语义：
+                //   defer 标记只在支持延迟加载的模型上有意义）。
+                boolean keepDeferFlag = supportsDefer && lazy && !activated.contains(d.name());
+                emitted.add(d.withDeferLoading(keepDeferFlag));
             }
         }
         // overlay.added 原样追加（会话级显式装配，不套过滤链）

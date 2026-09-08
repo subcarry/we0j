@@ -106,6 +106,8 @@ public final class RuntimeBootstrap implements AutoCloseable {
         public ModelCard modelCardOverride;
         /** 覆盖 maxSteps 门禁（null → settings.common.loop.maxSteps → Defaults.LOOP_MAX_STEPS）。 */
         public Integer maxStepsOverride;
+        /** 首会话权限模式（headless 无人值守用 BYPASS；null → ASK）。 */
+        public com.we0j.common.domain.permission.PermissionMode permissionMode;
     }
 
     private final Path projectRoot;
@@ -239,6 +241,8 @@ public final class RuntimeBootstrap implements AutoCloseable {
         // ── 会话层 ──────────────────────────────────────────────────────────
         SessionStateCache cache = new SessionStateCache();
         SessionRegistry registry = new SessionRegistry();
+        // tool→agent 反向依赖缝：SessionRegistry 实现 PendingSessions（M2 权限组交付）。
+        com.we0j.tool.permission.PendingSessions pendingSessions = registry;
         SessionService sessions = new SessionService(sessionRepo, messageRepo, partRepo, cache, bus,
                 throttler, fileStore, PathResolver::new, settingsStore, costCalculator, tx);
 
@@ -251,6 +255,34 @@ public final class RuntimeBootstrap implements AutoCloseable {
         ModelClient modelClient = new ModelClient(providerRegistry, new ParamDropper());
         RetryScheduler retry = new RetryScheduler();
 
+        // ── 权限/提问子系统（M2 交付物，DDD §5.8/§5.9）──────────────────────
+        com.we0j.tool.permission.RulesetMerger rulesetMerger = new com.we0j.tool.permission.RulesetMerger();
+        com.we0j.tool.permission.DoomLoopDetector doomLoop = new com.we0j.tool.permission.DoomLoopDetector();
+        com.we0j.tool.permission.PermissionScopeResolver scopeResolver =
+                new com.we0j.tool.permission.PermissionScopeResolver(null);   // M1 无 parent 概念 → 恒自身
+        com.we0j.tool.permission.RuntimeRulesSink runtimeRulesSink =
+                new com.we0j.tool.permission.RuntimeRulesSink() {
+                    @Override public void appendRules(String sid, java.util.List<com.we0j.common.domain.permission.PermissionRule> rules) {
+                        sessions.updateRuntimeState(sid, rt -> rt.plusRuntimeRules(rules));
+                    }
+                    @Override public void setPermissionMode(String sid, com.we0j.common.domain.permission.PermissionMode mode) {
+                        sessions.updateRuntimeState(sid, rt -> rt.withPermissionMode(mode));
+                    }
+                };
+        com.we0j.tool.permission.RulesetContextSource contextSource = sid -> {
+            com.we0j.common.domain.session.RuntimeState rt = cache.has(sid)
+                    ? cache.runtimeState(sid)
+                    : com.we0j.common.domain.session.RuntimeState.empty();
+            return new com.we0j.tool.permission.RulesetContext(settingsStore.current(root),
+                    java.util.List.of(), rt.runtimePermissionRules(), rt.permissionMode());
+        };
+        com.we0j.tool.permission.PermissionService permissions =
+                new com.we0j.tool.permission.PermissionService(rulesetMerger, pendingSessions, bus,
+                        scopeResolver, new com.we0j.tool.permission.DoomLoopDetector(),
+                        contextSource, runtimeRulesSink);
+        com.we0j.tool.permission.question.QuestionService questions =
+                new com.we0j.tool.permission.question.QuestionService(pendingSessions, bus, scopeResolver);
+
         // ── 工具层装配（DDD §5.6.2–5.6.4 / §5.2.5）─────────────────────────
         ToolSchemaGenerator schemas = new ToolSchemaGenerator();
         // TODO(M2 集成，主线程合入时替换)：内置工具/权限服务已由并行 Agent 交付（本波只交付 registry 包），
@@ -261,7 +293,29 @@ public final class RuntimeBootstrap implements AutoCloseable {
         //           new EditTool(...), new BashTool(parser, arity, shellExec),
         //           new GlobTool(rg, resolver), new GrepTool(rg), new AskUserQuestionTool(...));
         // 当前先空列表：registry 无工具 → resolve 下发空集 → Loop 行为与 M1 一致，零回归风险。
-        List<Tool> toolBeans = List.of();
+        com.we0j.infra.filetime.FileTimeRegistry fileTime = new com.we0j.infra.filetime.FileTimeRegistry();
+        com.we0j.tool.builtin.file.CodeIntelligence lsp = new com.we0j.tool.builtin.file.NoopCodeIntelligence();
+        com.we0j.tool.builtin.file.AtomicFileWriter atomicWriter =
+                new com.we0j.tool.builtin.file.AtomicFileWriter();
+        com.we0j.tool.builtin.file.ReplacerChain replacers = new com.we0j.tool.builtin.file.ReplacerChain();
+        com.we0j.tool.builtin.file.DiffRenderer diffs = new com.we0j.tool.builtin.file.DiffRenderer();
+        com.we0j.tool.builtin.search.RipgrepClient ripgrep = new com.we0j.tool.builtin.search.RipgrepClient();
+        com.we0j.tool.builtin.search.GlobResolver globResolver =
+                new com.we0j.tool.builtin.search.GlobResolver();
+        com.we0j.tool.builtin.shell.BashCommandParser bashParser =
+                new com.we0j.tool.builtin.shell.BashCommandParser();
+        com.we0j.tool.builtin.shell.ShellExecutor shellExecutor =
+                new com.we0j.tool.builtin.shell.ShellExecutor();
+
+        List<Tool> toolBeans = java.util.List.of(
+                new com.we0j.tool.builtin.file.ReadTool(fileTime, lsp),
+                new com.we0j.tool.builtin.file.WriteTool(fileTime, lsp, atomicWriter),
+                new com.we0j.tool.builtin.file.EditTool(fileTime, replacers, diffs, lsp, atomicWriter),
+                new com.we0j.tool.builtin.shell.BashTool(bashParser, new com.we0j.tool.permission.BashArityTable(),
+                        shellExecutor),
+                new com.we0j.tool.builtin.search.GrepTool(ripgrep),
+                new com.we0j.tool.builtin.search.GlobTool(ripgrep, globResolver),
+                new com.we0j.tool.builtin.question.AskUserQuestionTool());
         ToolRegistry toolRegistry = new ToolRegistry(toolBeans, schemas);
         OverlayStore toolOverlays = new OverlayStore();
         // 激活态读写缝：挂 SessionStateCache/Sessions 的 runtimeState.activatedDeferredTools（FR-065/FR-013）。
@@ -285,34 +339,15 @@ public final class RuntimeBootstrap implements AutoCloseable {
         ToolResolver toolResolver = new ToolResolver(toolRegistry, toolOverlays, toolActivations);
         OutputTruncator truncator = new OutputTruncator();
         ToolOutputStorage outputStorage = new ToolOutputStorage(resolver);
-        // 装配缝：GateProvider（M2 权限/提问子系统由并行 Agent 交付，未落地前用安全默认）。
         GateProvider gates = new GateProvider() {
             @Override
             public PermissionGate permissionGate(String sessionId, String partId, String callId) {
-                // TODO(M2 集成)：改挂 com.we0j.tool.permission.PermissionService.gateFor(sessionId, partId,
-                //   callId)（已交付，规则求值 + ask 阻塞等待）。当前保守全量放行（与 Settings 默认
-                //   "*": ALLOW 一致），避免在主线程集成前引入未验证的依赖链。
-                return new PermissionGate() {
-                    @Override
-                    public void ask(PermissionName name, java.util.List<String> patterns, String message,
-                                    java.util.Map<String, Object> metadata, java.util.List<String> alwaysPatterns) {
-                        // no-op：无 PermissionService 前不阻塞工具执行
-                    }
-
-                    @Override
-                    public Action check(PermissionName name, String pattern) {
-                        return Action.ALLOW;
-                    }
-                };
+                return permissions.gateFor(sessionId, partId, callId);
             }
 
             @Override
             public QuestionGate questionGate(String sessionId, String partId, String callId) {
-                // TODO(M2 集成)：改挂 com.we0j.tool.permission.question.QuestionService.gateFor(...)
-                //   （已交付：问卷上屏 + Bus QuestionAsked + 阻塞回复）。
-                return (request, abort) -> {
-                    throw new ToolException("QuestionService is not wired in this build yet.");
-                };
+                return questions.gateFor(sessionId, partId, callId);
             }
 
             @Override
