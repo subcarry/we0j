@@ -35,6 +35,24 @@ import com.we0j.llm.spi.ModelCard;
 import com.we0j.llm.spi.ModelProvider;
 import com.we0j.llm.token.CostCalculator;
 import com.we0j.llm.transform.ParamDropper;
+import com.we0j.common.domain.part.ToolPart;
+import com.we0j.common.domain.part.ToolState;
+import com.we0j.common.domain.permission.Action;
+import com.we0j.common.domain.permission.PermissionName;
+import com.we0j.common.exception.ToolException;
+import com.we0j.tool.registry.HookChain;
+import com.we0j.tool.registry.OutputTruncator;
+import com.we0j.tool.registry.OverlayStore;
+import com.we0j.tool.registry.ToolExecutor;
+import com.we0j.tool.registry.ToolOutputStorage;
+import com.we0j.tool.registry.ToolRegistry;
+import com.we0j.tool.registry.ToolResolver;
+import com.we0j.tool.registry.ToolSchemaGenerator;
+import com.we0j.tool.spi.GateProvider;
+import com.we0j.tool.spi.PermissionGate;
+import com.we0j.tool.spi.QuestionGate;
+import com.we0j.tool.spi.SessionSink;
+import com.we0j.tool.spi.Tool;
 import jakarta.persistence.EntityManager;
 import jakarta.persistence.EntityManagerFactory;
 import java.nio.file.Files;
@@ -107,13 +125,18 @@ public final class RuntimeBootstrap implements AutoCloseable {
     private final ModelCardManager cards;
     private final ModelClient modelClient;
     private final ExecutorService loopExecutor;
+    private final ToolRegistry toolRegistry;
+    private final ToolResolver toolResolver;
+    private final ToolExecutor toolExecutor;
 
     private RuntimeBootstrap(Path projectRoot, PathResolver resolver, DataSource dataSource,
                              JdbcTemplate jdbc, EntityManagerFactory emf, TransactionTemplate tx,
                              Bus bus, SettingsStore settingsStore, JsonFileStore fileStore,
                              PartWriteThrottler throttler, SessionStateCache cache,
                              SessionRegistry registry, SessionService sessions, SessionFacade facade,
-                             ModelCardManager cards, ModelClient modelClient, ExecutorService loopExecutor) {
+                             ModelCardManager cards, ModelClient modelClient, ExecutorService loopExecutor,
+                             ToolRegistry toolRegistry, ToolResolver toolResolver,
+                             ToolExecutor toolExecutor) {
         this.projectRoot = projectRoot;
         this.resolver = resolver;
         this.dataSource = dataSource;
@@ -131,6 +154,9 @@ public final class RuntimeBootstrap implements AutoCloseable {
         this.cards = cards;
         this.modelClient = modelClient;
         this.loopExecutor = loopExecutor;
+        this.toolRegistry = toolRegistry;
+        this.toolResolver = toolResolver;
+        this.toolExecutor = toolExecutor;
     }
 
     public static RuntimeBootstrap init(Path projectRoot) {
@@ -225,6 +251,91 @@ public final class RuntimeBootstrap implements AutoCloseable {
         ModelClient modelClient = new ModelClient(providerRegistry, new ParamDropper());
         RetryScheduler retry = new RetryScheduler();
 
+        // ── 工具层装配（DDD §5.6.2–5.6.4 / §5.2.5）─────────────────────────
+        ToolSchemaGenerator schemas = new ToolSchemaGenerator();
+        // TODO(M2 集成，主线程合入时替换)：内置工具/权限服务已由并行 Agent 交付（本波只交付 registry 包），
+        //   集成时在此手工 new 依赖链并登记，例如：
+        //   PermissionService permissions = new PermissionService(merger, pending, bus, ...);
+        //   QuestionService questions = new QuestionService(pendingQ, bus, ...);
+        //   List<Tool> toolBeans = List.of(new ReadTool(fileTime, lsp), new WriteTool(...),
+        //           new EditTool(...), new BashTool(parser, arity, shellExec),
+        //           new GlobTool(rg, resolver), new GrepTool(rg), new AskUserQuestionTool(...));
+        // 当前先空列表：registry 无工具 → resolve 下发空集 → Loop 行为与 M1 一致，零回归风险。
+        List<Tool> toolBeans = List.of();
+        ToolRegistry toolRegistry = new ToolRegistry(toolBeans, schemas);
+        OverlayStore toolOverlays = new OverlayStore();
+        // 激活态读写缝：挂 SessionStateCache/Sessions 的 runtimeState.activatedDeferredTools（FR-065/FR-013）。
+        ToolResolver.ToolActivation toolActivations = new ToolResolver.ToolActivation() {
+            @Override
+            public java.util.Set<String> activated(String sessionId) {
+                return cache.has(sessionId) ? cache.runtimeState(sessionId).activatedDeferredTools()
+                        : java.util.Set.of();
+            }
+
+            @Override
+            public void recordActivation(String sessionId, String name) {
+                if (!cache.has(sessionId)
+                        || cache.runtimeState(sessionId).activatedDeferredTools().contains(name)) {
+                    return;
+                }
+                sessions.updateRuntimeState(sessionId,
+                        rt -> rt.withActivatedTools(java.util.List.of(name)));
+            }
+        };
+        ToolResolver toolResolver = new ToolResolver(toolRegistry, toolOverlays, toolActivations);
+        OutputTruncator truncator = new OutputTruncator();
+        ToolOutputStorage outputStorage = new ToolOutputStorage(resolver);
+        // 装配缝：GateProvider（M2 权限/提问子系统由并行 Agent 交付，未落地前用安全默认）。
+        GateProvider gates = new GateProvider() {
+            @Override
+            public PermissionGate permissionGate(String sessionId, String partId, String callId) {
+                // TODO(M2 集成)：改挂 com.we0j.tool.permission.PermissionService.gateFor(sessionId, partId,
+                //   callId)（已交付，规则求值 + ask 阻塞等待）。当前保守全量放行（与 Settings 默认
+                //   "*": ALLOW 一致），避免在主线程集成前引入未验证的依赖链。
+                return new PermissionGate() {
+                    @Override
+                    public void ask(PermissionName name, java.util.List<String> patterns, String message,
+                                    java.util.Map<String, Object> metadata, java.util.List<String> alwaysPatterns) {
+                        // no-op：无 PermissionService 前不阻塞工具执行
+                    }
+
+                    @Override
+                    public Action check(PermissionName name, String pattern) {
+                        return Action.ALLOW;
+                    }
+                };
+            }
+
+            @Override
+            public QuestionGate questionGate(String sessionId, String partId, String callId) {
+                // TODO(M2 集成)：改挂 com.we0j.tool.permission.question.QuestionService.gateFor(...)
+                //   （已交付：问卷上屏 + Bus QuestionAsked + 阻塞回复）。
+                return (request, abort) -> {
+                    throw new ToolException("QuestionService is not wired in this build yet.");
+                };
+            }
+
+            @Override
+            public com.we0j.tool.spi.ToolOutputSink outputSink(String sessionId, String callId) {
+                return outputStorage.sinkFor(sessionId, callId);
+            }
+
+            @Override
+            public java.nio.file.Path workdir(String sessionId) {
+                // TODO(M2): 随 worktree/多项目会话切换改读 session 行记录的 workdir。
+                return root;
+            }
+        };
+        // SessionSink：状态回写经 SessionService（cache 权威副本 + 节流落库 + Bus part.updated）。
+        SessionSink sessionSink = (sid, partId, state) -> {
+            if (cache.part(partId).orElse(null) instanceof ToolPart tp) {
+                boolean terminal = state instanceof ToolState.Completed || state instanceof ToolState.Error;
+                sessions.updatePart(tp.withState(state), terminal);
+            }
+        };
+        ToolExecutor toolExecutor = new ToolExecutor(toolResolver, gates, sessionSink, truncator,
+                HookChain.NOOP);
+
         // ── Loop 工厂 + 门面 ────────────────────────────────────────────────
         Settings settings = settingsStore.current(root);
         ModelCard card = opts.modelCardOverride != null
@@ -235,14 +346,15 @@ public final class RuntimeBootstrap implements AutoCloseable {
 
         AgentLoopFactory loopFactory = (sid, entry) -> new AgentLoop(sid, entry,
                 new AgentLoop.Deps(sessions, cache, bus, registry, card, modelClient, costCalculator,
-                        retry, settings, null, maxSteps));
+                        retry, settings, null, maxSteps, toolExecutor, toolResolver));
         ExecutorService loopExecutor = VirtualThreadExecutors.io("we0j-loop-");
         SessionFacade facade = new SessionFacade(sessions, registry, loopFactory, loopExecutor);
 
         log.info("we0j runtime ready root={} db={} projectId={}", root, resolver.runtimeDbPath(),
                 resolver.projectId());
         return new RuntimeBootstrap(root, resolver, ds, jdbc, emf, tx, bus, settingsStore, fileStore,
-                throttler, cache, registry, sessions, facade, cards, modelClient, loopExecutor);
+                throttler, cache, registry, sessions, facade, cards, modelClient, loopExecutor,
+                toolRegistry, toolResolver, toolExecutor);
     }
 
     // ── getters（CLI 消费面）──────────────────────────────────────────────────
@@ -261,6 +373,9 @@ public final class RuntimeBootstrap implements AutoCloseable {
     public ModelCardManager cards() { return cards; }
     public ModelClient modelClient() { return modelClient; }
     public TransactionTemplate tx() { return tx; }
+    public ToolRegistry toolRegistry() { return toolRegistry; }
+    public ToolResolver toolResolver() { return toolResolver; }
+    public ToolExecutor toolExecutor() { return toolExecutor; }
 
     /** 直接读行（诊断 / 测试断言用）。 */
     public List<MessageRow> messageRows(String sessionId) {

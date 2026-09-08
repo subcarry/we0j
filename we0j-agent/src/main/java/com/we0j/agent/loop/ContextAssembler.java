@@ -14,17 +14,21 @@ import com.we0j.llm.spi.ContentBlock;
 import com.we0j.llm.spi.ModelCard;
 import com.we0j.llm.spi.ProviderMessage;
 import com.we0j.llm.spi.PromptBlock;
+import com.we0j.llm.spi.ToolDefinition;
 import com.we0j.llm.token.ContextWindowResolver;
 import java.util.ArrayList;
 import java.util.List;
 import java.util.Map;
 
 /**
- * 最小上下文装配（DDD §5.4 / FR-041 的 M1 子集）：历史 → ChatRequest。
+ * 最小上下文装配（DDD §5.4 / FR-041 的 M1 子集 + M2 工具 schema 接入）：历史 → ChatRequest。
  *
- * <p>M1 范围：单 system 块（无 contributor 链 / AGENTS.md / skills 注入，TODO M2）；
- * 历史直转 ProviderMessage；工具为空；cacheStrategy=DEFAULT。
- * Reasoning 回传（Anthropic thinking signature，FR-040）M1 按任务指示简化跳过。
+ * <p>M2 增量：{@link #assemble(String, List, ModelCard, Settings, List)} 接受 ToolResolver 解析后的
+ * 工具定义列表挂到 ChatRequest.tools（AgentLoop 步骤 8 经 resolver 得到非 lazy 子集；
+ * deferred 名字的 reminder 渲染随 M2+ DeferredToolsContributor 落地）。
+ *
+ * <p>仍属 M1 范围：单 system 块（无 contributor 链 / AGENTS.md / skills 注入，TODO M2）；
+ * cacheStrategy=DEFAULT。Reasoning 回传（Anthropic thinking signature，FR-040）M1 按任务指示简化跳过。
  */
 public final class ContextAssembler {
 
@@ -32,9 +36,15 @@ public final class ContextAssembler {
     public static final String BASE_SYSTEM =
             "You are We0J, a helpful coding agent. Respond in the user's language.";
 
-    /** 装配统一模型请求。 */
+    /** 装配统一模型请求（无工具兼容入口，M1 行为）。 */
     public ChatRequest assemble(String sessionId, List<MessageWithParts> history,
                                 ModelCard card, Settings settings) {
+        return assemble(sessionId, history, card, settings, List.of());
+    }
+
+    /** 装配统一模型请求；tools = ToolResolver.resolve 下发的定义集（已过滤 lazy）。 */
+    public ChatRequest assemble(String sessionId, List<MessageWithParts> history, ModelCard card,
+                                Settings settings, List<ToolDefinition> tools) {
         List<PromptBlock> system = List.of(new PromptBlock("core", systemText(settings), false));
         List<ProviderMessage> messages = new ArrayList<>();
         for (MessageWithParts mwp : history) {
@@ -47,7 +57,7 @@ public final class ContextAssembler {
                 .model(card)
                 .system(system)
                 .messages(messages)
-                .tools(List.of())                         // M1 无工具（M2 接 ToolRegistry 解析结果）
+                .tools(tools == null ? List.of() : tools)
                 .cacheStrategy(CacheStrategy.DEFAULT)
                 .maxOutputTokens(ContextWindowResolver.maxOutput(card))
                 .build();

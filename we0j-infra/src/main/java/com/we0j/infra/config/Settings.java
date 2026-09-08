@@ -2,12 +2,18 @@ package com.we0j.infra.config;
 
 import com.fasterxml.jackson.annotation.JsonCreator;
 import com.fasterxml.jackson.annotation.JsonProperty;
+import com.fasterxml.jackson.core.JsonParser;
+import com.fasterxml.jackson.core.JsonToken;
+import com.fasterxml.jackson.databind.DeserializationContext;
+import com.fasterxml.jackson.databind.JsonDeserializer;
 import com.fasterxml.jackson.databind.JsonNode;
 import com.we0j.common.domain.permission.Action;
 import com.we0j.common.util.Wildcards;
+import java.io.IOException;
 import java.math.BigDecimal;
 import java.util.LinkedHashMap;
 import java.util.List;
+import java.util.Locale;
 import java.util.Map;
 import java.util.Set;
 import java.util.regex.Pattern;
@@ -27,7 +33,8 @@ public record Settings(Common common, Code code, Web web) {
             String language,
             Chat chat,
             Map<String, ProviderConfig> providers,
-            Map<String, Action> permission,               // key = PermissionName.wire() 或 "*"
+            @com.fasterxml.jackson.databind.annotation.JsonDeserialize(contentUsing = Settings.PermissionValueDeserializer.class)
+            Map<String, Object> permission,              // key = PermissionName.wire() 或 "*"；value = Action（简写）或 Map<pattern,Action>（展开，FR-081）
             Map<String, McpServerConfig> mcpServers,
             Map<String, LspServerConfig> lspServers,
             Map<String, ServiceConfig> services,
@@ -165,5 +172,31 @@ public record Settings(Common common, Code code, Web web) {
 
         Web web = new Web(8787, "127.0.0.1", null, null, false);
         return new Settings(common, code, web);
+    }
+
+    /**
+     * common.permission 的双形态 value 反序列化（FR-081）：
+     * <ul>
+     *   <li>简写  {@code "bash": "ask"}                → {@code Action.ASK}（保持既有语义）</li>
+     *   <li>展开  {@code "bash": {"git *": "allow"}}   → {@code Map<String, Action>}（pattern → action）</li>
+     * </ul>
+     * 枚举值大小写不敏感（"allow" → ALLOW），与 {@link ConfigMappers} 的宽容策略一致。
+     */
+    public static final class PermissionValueDeserializer extends JsonDeserializer<Object> {
+
+        @Override
+        public Object deserialize(JsonParser p, DeserializationContext ctxt) throws IOException {
+            if (p.currentToken() == JsonToken.START_OBJECT) {
+                JsonNode node = p.getCodec().readTree(p);
+                Map<String, Action> patterns = new LinkedHashMap<>();
+                node.properties().forEach(e -> patterns.put(e.getKey(), toAction(e.getValue().asText())));
+                return patterns;
+            }
+            return toAction(p.getText());
+        }
+
+        private static Action toAction(String value) {
+            return Action.valueOf(value.trim().toUpperCase(Locale.ROOT));
+        }
     }
 }

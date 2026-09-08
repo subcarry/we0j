@@ -26,7 +26,10 @@ import com.we0j.llm.registry.ModelClient;
 import com.we0j.llm.resilience.RetryScheduler;
 import com.we0j.llm.spi.ChatRequest;
 import com.we0j.llm.spi.ModelCard;
+import com.we0j.llm.spi.ToolDefinition;
 import com.we0j.llm.token.CostCalculator;
+import com.we0j.tool.registry.ToolExecutor;
+import com.we0j.tool.registry.ToolResolver;
 import java.math.BigDecimal;
 import java.time.Instant;
 import java.util.ArrayList;
@@ -65,10 +68,22 @@ public final class AgentLoop {
             RetryScheduler retry,
             Settings settings,
             ContextAssembler assembler,
-            int maxSteps) {
+            int maxSteps,
+            /** M2 工具批量执行器；null = 保留 M1 占位行为（手工装配渐进接线期的 null 安全）。 */
+            ToolExecutor toolExecutor,
+            /** M2 工具解析器（schema 下发）；null = 本轮不下发工具（M1 行为）。 */
+            ToolResolver toolResolver) {
 
         public Deps {
             if (assembler == null) assembler = new ContextAssembler();
+        }
+
+        /** M1 兼容构造（无工具依赖，均 null → 占位行为）。 */
+        public Deps(SessionService sessions, SessionStateCache cache, Bus bus, SessionRegistry registry,
+                    ModelCard card, ModelClient modelClient, CostCalculator costs, RetryScheduler retry,
+                    Settings settings, ContextAssembler assembler, int maxSteps) {
+            this(sessions, cache, bus, registry, card, modelClient, costs, retry, settings, assembler,
+                    maxSteps, null, null);
         }
     }
 
@@ -89,6 +104,9 @@ public final class AgentLoop {
         BigDecimal cost = BigDecimal.ZERO;
         LoopExitReason reason = LoopExitReason.COMPLETED_REPLY;
         MessageError outcomeError = null;
+        // 工具结果已回写历史、待模型消化：置位后跳过步骤 4 的“已完成回复”判定，
+        // 保证下一轮必须再走一次模型调用；此后的出口由步骤 14 空 toolCalls 判定接管。
+        boolean awaitToolReply = false;
 
         try {
             // TODO(M2): resumeExisting → waitForActiveSession()；FR-102 consumePendingRevert()。
@@ -108,7 +126,7 @@ public final class AgentLoop {
                 LoopMarkers m = LoopMarkers.extract(msgs);
 
                 // ── 4. 主退出判定（FR-022）──────────────────────────────────
-                if (m.hasCompletedReplyForLastUser()) {
+                if (!awaitToolReply && m.hasCompletedReplyForLastUser()) {
                     reason = LoopExitReason.COMPLETED_REPLY;
                     break;
                 }
@@ -117,8 +135,19 @@ public final class AgentLoop {
                 // ── 6. TODO(M2): pendingCompaction 处理（CONTINUE / BREAK / NONE）──
                 // ── 7. TODO(M2, FR-051 时机②): 请求前溢出预检 → schedule + continue ──
 
-                // ── 8. 上下文构建（M1：无工具、无 contributor 链）────────────
-                ChatRequest request = deps.assembler().assemble(sessionId, msgs, deps.card(), deps.settings());
+                // ── 8. 上下文构建（M2：工具 schema 经 ToolResolver；resolver=null → 无工具）──
+                List<ToolDefinition> toolDefs = List.of();
+                if (deps.toolResolver() != null) {
+                    // TODO(M2, FR-065): deferredNames 交给 DeferredToolsContributor 渲染
+                    //   <available-deferred-tools> reminder；agent 人格/渠道过滤随 SessionFacade 透传后启用，
+                    //   暂固定 ChannelSource.CLI + readOnlyMode=false（plan 模式随 M2 模式切换落地）。
+                    ToolResolver.ResolvedTools resolved = deps.toolResolver().resolve(
+                            new ToolResolver.ResolveCommand(sessionId, deps.card(), deps.settings(),
+                                    null, com.we0j.common.domain.message.ChannelSource.CLI, false, null));
+                    toolDefs = resolved.definitions();
+                }
+                ChatRequest request = deps.assembler().assemble(sessionId, msgs, deps.card(),
+                        deps.settings(), toolDefs);
 
                 // ── 9. TODO(M2, FR-051 时机③前置复检): bundle 估算 tokens 溢出复检 ──
 
@@ -165,25 +194,45 @@ public final class AgentLoop {
                     break;
                 }
 
-                // ── 14. 工具子循环 ──────────────────────────────────────────
+                // ── 14. 工具子循环（DDD §5.2.2 步骤 14：真实批量执行）────────
                 if (toolCalls.isEmpty()) {
                     reason = LoopExitReason.COMPLETED_REPLY;
                     break;
                 }
-                // TODO(M2): toolExecutor.executeBatch（并发执行 + 权限 + 截断落盘 + 输出回流）。
-                // M1 占位：把本轮 ToolPart 置为 Completed(placeholder)，历史推进到下一轮。
                 setStatus(new SessionStatus.Busy(step, "tools"));
-                for (PendingToolCall call : toolCalls) {
-                    if (deps.cache().part(call.partId()).orElse(null) instanceof ToolPart tp
-                            && !(tp.state() instanceof ToolState.Completed)
-                            && !(tp.state() instanceof ToolState.Error)) {
-                        deps.sessions().updatePart(tp.withState(new ToolState.Completed(
-                                call.input(), TOOL_UNAVAILABLE_PLACEHOLDER, null, Map.of(),
-                                new TimeRangeCompacted(Instant.now(), Instant.now(), null),
-                                List.of())), true);
+                if (deps.toolExecutor() == null) {
+                    // M1 占位行为保留（toolExecutor=null 时的 null 安全降级）：
+                    // 把本轮 ToolPart 置为 Completed(placeholder)，历史推进到下一轮。
+                    for (PendingToolCall call : toolCalls) {
+                        if (deps.cache().part(call.partId()).orElse(null) instanceof ToolPart tp
+                                && !(tp.state() instanceof ToolState.Completed)
+                                && !(tp.state() instanceof ToolState.Error)) {
+                            deps.sessions().updatePart(tp.withState(new ToolState.Completed(
+                                    call.input(), TOOL_UNAVAILABLE_PLACEHOLDER, null, Map.of(),
+                                    new TimeRangeCompacted(Instant.now(), Instant.now(), null),
+                                    List.of())), true);
+                        }
                     }
+                    // M1 旧行为：不置 awaitToolReply，下一轮由步骤 4 正常出口（COMPLETED_REPLY）。
+                } else {
+                    List<ToolExecutor.PendingToolCall> mapped = toolCalls.stream()
+                            .map(c -> new ToolExecutor.PendingToolCall(c.partId(), c.toolCallId(),
+                                    c.toolName(), c.input()))
+                            .toList();
+                    ToolExecutor.ToolBatchOutcome batch = deps.toolExecutor().executeBatch(
+                            new ToolExecutor.ToolBatchCommand(sessionId, assistant.id(), mapped,
+                                    abort.child(), deps.settings(), RuntimeLaneRegistry.current(),
+                                    deps.card()));
+                    // 结果不直接注入请求：continue 后下一轮从（已含终态 ToolPart 的）历史重新推导，
+                    // ContextAssembler 把 Completed/Error ToolPart 映射为 tool_calls + role=tool 消息。
+                    if (batch.allDenied()) {
+                        // TODO(M2, FR-081): Settings 尚无 continueLoopOnDeny 配置、LoopExitReason 尚无
+                        //   STOP_SIGNAL；暂按“DENIED 文本回灌模型自行调整”处理。
+                        log.info("all tool calls denied session={} count={}", sessionId, batch.denied());
+                    }
+                    awaitToolReply = true;
+                    continue;   // 回到步骤 1，让模型消化工具结果
                 }
-                // 回到步骤 1：下一轮从（已含工具结果的）历史重新推导 → 新 AssistantMessage + 新 TurnProcessor
             }
 
             // ── 收尾 ────────────────────────────────────────────────────────
