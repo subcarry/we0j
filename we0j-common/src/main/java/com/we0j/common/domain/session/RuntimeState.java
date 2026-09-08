@@ -55,6 +55,12 @@ public record RuntimeState(
                 invokedSkills, lastModelRef, v, extra);
     }
 
+    /** 替换 extra 键值集（worktree 路径、microcompact 边界等扩展位，FR-082）。 */
+    public RuntimeState withExtra(Map<String, Object> v) {
+        return new RuntimeState(agentName, permissionMode, runtimePermissionRules, activatedDeferredTools,
+                invokedSkills, lastModelRef, pendingRevert, v);
+    }
+
     public RuntimeState withActivatedDeferredTools(Set<String> v) {
         return new RuntimeState(agentName, permissionMode, runtimePermissionRules, v,
                 invokedSkills, lastModelRef, pendingRevert, extra);

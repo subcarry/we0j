@@ -180,6 +180,7 @@ public final class ToolExecutor {
                     .questions(gates.questionGate(cmd.sessionId(), call.partId(), call.callId()))
                     .output(gates.outputSink(cmd.sessionId(), call.callId()))
                     .model(cmd.model())
+                    .mutator(gates.sessionMutator())
                     .build();
 
             // 5) 执行（工具内部自行 askPermission）

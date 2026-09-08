@@ -16,4 +16,7 @@ public interface GateProvider {
 
     /** 会话工作目录。 */
     java.nio.file.Path workdir(String sessionId);
+
+    /** 会话 RuntimeState 演进缝（FR-081/FR-082：plan 人格切换、worktree 路径持久化）；默认无操作。 */
+    default SessionMutator sessionMutator() { return SessionMutator.NOOP; }
 }

@@ -50,7 +50,10 @@ public final class ToolResolver {
     /** plan/只读模式下保留的工具（无副作用权限集；PermissionName 粒度下启发式，ToolAnnotations 落地后替换）。 */
     static final Set<PermissionName> READ_ONLY_PERMISSIONS = EnumSet.of(
             PermissionName.READ, PermissionName.GLOB, PermissionName.GREP, PermissionName.LSP,
-            PermissionName.TODOREAD, PermissionName.TASK_OUTPUT, PermissionName.TOOL_SEARCH);
+            PermissionName.TODOREAD, PermissionName.TASK_OUTPUT, PermissionName.TOOL_SEARCH,
+            // FR-081（M5）：模式切换元操作必须在 plan 模式内可见，否则无法 ExitPlanMode 脱困；
+            //   QUESTION 只读（向用户提问），plan 期澄清需求依赖它。
+            PermissionName.PLAN_ENTER, PermissionName.PLAN_EXIT, PermissionName.QUESTION);
 
     private final ToolRegistry registry;
     private final OverlayStore overlays;

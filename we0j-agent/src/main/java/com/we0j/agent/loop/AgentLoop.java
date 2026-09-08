@@ -1,5 +1,7 @@
 package com.we0j.agent.loop;
 
+import com.we0j.agent.compaction.CompactionService;
+import com.we0j.agent.compaction.MicroCompactor;
 import com.we0j.agent.session.MessageWithParts;
 import com.we0j.agent.session.SessionRegistry;
 import com.we0j.agent.session.SessionService;
@@ -143,12 +145,17 @@ public final class AgentLoop {
                 // ── 8. 上下文构建（M2：工具 schema 经 ToolResolver；resolver=null → 无工具）──
                 List<ToolDefinition> toolDefs = List.of();
                 if (deps.toolResolver() != null) {
+                    // FR-081（M5）：plan 人格 → 只读工具收敛（ToolResolver 步骤 6）；agentName 由
+                    //   EnterPlanMode/ExitPlanModeTool 经 SessionMutator 演进（resume 后随 restore 恢复）。
+                    String agentName = deps.cache() != null && deps.cache().has(sessionId)
+                            ? deps.cache().runtimeState(sessionId).agentName() : null;
+                    boolean planMode = com.we0j.tool.builtin.mode.EnterPlanModeTool.PLAN_AGENT
+                            .equals(agentName);
                     // TODO(M2, FR-065): deferredNames 交给 DeferredToolsContributor 渲染
-                    //   <available-deferred-tools> reminder；agent 人格/渠道过滤随 SessionFacade 透传后启用，
-                    //   暂固定 ChannelSource.CLI + readOnlyMode=false（plan 模式随 M2 模式切换落地）。
+                    //   <available-deferred-tools> reminder；agentInfo 人格交集过滤随后续里程碑启用。
                     ToolResolver.ResolvedTools resolved = deps.toolResolver().resolve(
                             new ToolResolver.ResolveCommand(sessionId, deps.card(), deps.settings(),
-                                    null, com.we0j.common.domain.message.ChannelSource.CLI, false, null));
+                                    null, com.we0j.common.domain.message.ChannelSource.CLI, planMode, null));
                     toolDefs = resolved.definitions();
                 }
                 ChatRequest request = deps.assembler().assemble(sessionId, msgs, deps.card(),
@@ -244,6 +251,8 @@ public final class AgentLoop {
 
             // ── 收尾 ────────────────────────────────────────────────────────
             // TODO(M2): finalizeTurn —— 异步标题生成、diff 摘要、todo 刷新。
+            // FR-054 空闲微压缩：本轮完成（正常/异常出口均到达此处）后、置 Idle 之前尝试一次。
+            microcompactIfIdle();
             log.debug("loop finished sid={} reason={} steps={} cost={}", sessionId, reason, step, cost);
             return new LoopOutcome(reason, step, accumulated, outcomeError);
 
@@ -261,6 +270,26 @@ public final class AgentLoop {
             deps.sessions().flushParts();                    // ★ 落盘全部 pending part
             deps.registry().release(sessionId);
             RuntimeLaneRegistry.clear();                     // 显式清泳道（facade 的 callAs 外层也会恢复）
+        }
+    }
+
+    /**
+     * 空闲接线（FR-054）：服务/模型卡缺失时跳过（手工装配渐进期的 null 安全）；
+     * 微压缩只读历史 + 替换早期工具输出，异常不得影响 Loop 收尾，全部吞掉仅记日志。
+     */
+    private void microcompactIfIdle() {
+        CompactionService compaction = deps.compactionService();
+        if (compaction == null || deps.card() == null) {
+            return;
+        }
+        try {
+            MicroCompactor.Result r = compaction.maybeMicrocompact(sessionId, deps.card());
+            if (r != null && r.partsCompacted() > 0) {
+                log.info("idle microcompact sid={} parts={} tokensSaved={}",
+                        sessionId, r.partsCompacted(), r.tokensSaved());
+            }
+        } catch (Exception e) {   // 含 Error 以外的装配/DB 异常
+            log.warn("idle microcompact failed sid={}: {}", sessionId, e.toString());
         }
     }
 

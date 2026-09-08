@@ -20,7 +20,8 @@ public record ToolContext(
         PermissionGate gate,
         QuestionGate questions,
         ToolOutputSink output,
-        com.we0j.llm.spi.ModelCard model) {
+        com.we0j.llm.spi.ModelCard model,
+        SessionMutator mutator) {
 
     /** 阻塞请求权限；每个阻塞点前 throwIfAborted 由 Loop 保证（FR-024）。 */
     public void askPermission(PermissionName name, java.util.List<String> patterns, String message,
@@ -42,6 +43,7 @@ public record ToolContext(
         private QuestionGate questions;
         private ToolOutputSink output;
         private com.we0j.llm.spi.ModelCard model;
+        private SessionMutator mutator = SessionMutator.NOOP;
 
         public Builder sessionId(String v) { this.sessionId = v; return this; }
         public Builder messageId(String v) { this.messageId = v; return this; }
@@ -54,10 +56,13 @@ public record ToolContext(
         public Builder questions(QuestionGate v) { this.questions = v; return this; }
         public Builder output(ToolOutputSink v) { this.output = v; return this; }
         public Builder model(com.we0j.llm.spi.ModelCard v) { this.model = v; return this; }
+        /** 会话 RuntimeState 演进缝（FR-081/FR-082）；null → NOOP。 */
+        public Builder mutator(SessionMutator v) { this.mutator = v == null ? SessionMutator.NOOP : v; return this; }
 
         public ToolContext build() {
             return new ToolContext(sessionId, messageId, callId, abort, workdir, lane,
-                    settings, gate, questions, output, model);
+                    settings, gate, questions, output, model,
+                    mutator == null ? SessionMutator.NOOP : mutator);
         }
     }
 }

@@ -126,6 +126,7 @@ public final class RuntimeBootstrap implements AutoCloseable {
     private final SessionFacade facade;
     private final ModelCardManager cards;
     private final ModelClient modelClient;
+    private final com.we0j.agent.compaction.CompactionService compactionService;
     private final ExecutorService loopExecutor;
     private final ToolRegistry toolRegistry;
     private final ToolResolver toolResolver;
@@ -138,7 +139,8 @@ public final class RuntimeBootstrap implements AutoCloseable {
                              SessionRegistry registry, SessionService sessions, SessionFacade facade,
                              ModelCardManager cards, ModelClient modelClient, ExecutorService loopExecutor,
                              ToolRegistry toolRegistry, ToolResolver toolResolver,
-                             ToolExecutor toolExecutor) {
+                             ToolExecutor toolExecutor,
+                             com.we0j.agent.compaction.CompactionService compactionService) {
         this.projectRoot = projectRoot;
         this.resolver = resolver;
         this.dataSource = dataSource;
@@ -155,6 +157,7 @@ public final class RuntimeBootstrap implements AutoCloseable {
         this.facade = facade;
         this.cards = cards;
         this.modelClient = modelClient;
+        this.compactionService = compactionService;
         this.loopExecutor = loopExecutor;
         this.toolRegistry = toolRegistry;
         this.toolResolver = toolResolver;
@@ -315,7 +318,12 @@ public final class RuntimeBootstrap implements AutoCloseable {
                         shellExecutor),
                 new com.we0j.tool.builtin.search.GrepTool(ripgrep),
                 new com.we0j.tool.builtin.search.GlobTool(ripgrep, globResolver),
-                new com.we0j.tool.builtin.question.AskUserQuestionTool());
+                new com.we0j.tool.builtin.question.AskUserQuestionTool(),
+                // M5（FR-081/FR-082）：模式切换 + worktree（均 deferLoading=false，常驻）
+                new com.we0j.tool.builtin.mode.EnterPlanModeTool(),
+                new com.we0j.tool.builtin.mode.ExitPlanModeTool(),
+                new com.we0j.tool.builtin.mode.EnterWorktreeTool(),
+                new com.we0j.tool.builtin.mode.ExitWorktreeTool());
         ToolRegistry toolRegistry = new ToolRegistry(toolBeans, schemas);
         OverlayStore toolOverlays = new OverlayStore();
         // 激活态读写缝：挂 SessionStateCache/Sessions 的 runtimeState.activatedDeferredTools（FR-065/FR-013）。
@@ -357,8 +365,22 @@ public final class RuntimeBootstrap implements AutoCloseable {
 
             @Override
             public java.nio.file.Path workdir(String sessionId) {
-                // TODO(M2): 随 worktree/多项目会话切换改读 session 行记录的 workdir。
+                // FR-082：EnterWorktree/ExitWorktree 经 RuntimeState.extra["worktree"] 切换工作目录；
+                //   缺失/已移除回退 root。（多项目会话 workdir 落 session 行记录仍属后续里程碑 TODO）
+                if (cache.has(sessionId)) {
+                    Object wt = cache.runtimeState(sessionId).extra()
+                            .get(com.we0j.tool.builtin.mode.EnterWorktreeTool.EXTRA_WORKTREE);
+                    if (wt instanceof String s && !s.isBlank() && Files.isDirectory(Path.of(s))) {
+                        return Path.of(s);
+                    }
+                }
                 return root;
+            }
+
+            @Override
+            public com.we0j.tool.spi.SessionMutator sessionMutator() {
+                // FR-081/FR-082 工具缝：cache 权威副本 + session.runtime_state 落盘（FR-013 resume 完整）。
+                return (sid, op) -> sessions.updateRuntimeState(sid, op);
             }
         };
         // SessionSink：状态回写经 SessionService（cache 权威副本 + 节流落库 + Bus part.updated）。
@@ -419,7 +441,7 @@ public final class RuntimeBootstrap implements AutoCloseable {
                 resolver.projectId());
         return new RuntimeBootstrap(root, resolver, ds, jdbc, emf, tx, bus, settingsStore, fileStore,
                 throttler, cache, registry, sessions, facade, cards, modelClient, loopExecutor,
-                toolRegistry, toolResolver, toolExecutor);
+                toolRegistry, toolResolver, toolExecutor, compactionService);
     }
 
     // ── getters（CLI 消费面）──────────────────────────────────────────────────
@@ -441,6 +463,9 @@ public final class RuntimeBootstrap implements AutoCloseable {
     public ToolRegistry toolRegistry() { return toolRegistry; }
     public ToolResolver toolResolver() { return toolResolver; }
     public ToolExecutor toolExecutor() { return toolExecutor; }
+
+    /** M3 压缩服务（CLI /compact 消费面；AgentLoop 空闲微压缩同源）。 */
+    public com.we0j.agent.compaction.CompactionService compactionService() { return compactionService; }
 
     /** 直接读行（诊断 / 测试断言用）。 */
     public List<MessageRow> messageRows(String sessionId) {
