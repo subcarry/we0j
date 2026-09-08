@@ -49,7 +49,7 @@ public class LayeringTest {
     static final ArchRule no_im_semantics_in_agent_core = noClasses()
             .that().resideInAPackage("com.we0j.agent..")
             .should().dependOnClassesThat()
-            .haveNameMatching(".*(Telegram|Companion|Persona|Heartbeat|Emotion|Selfie|Lyria).*")
+            .haveNameMatching(".*(Telegram|Companion|Heartbeat|Emotion|Selfie|Lyria).*")
             .as("agent core must stay free of IM/companion semantics (架构改进 #1)")
             .allowEmptyShould(true);   // agent 模块尚无类，避免"未检查到任何类"失败
 

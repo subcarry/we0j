@@ -1,42 +1,107 @@
 package com.we0j.agent.loop;
 
+import com.we0j.agent.context.ContributeContext;
+import com.we0j.agent.context.ContextContributor;
+import com.we0j.agent.context.EnvInfoRenderer;
+import com.we0j.agent.context.HistoryConverter;
+import com.we0j.agent.context.MessageNormalizer;
+import com.we0j.agent.context.PromptBlockCache;
+import com.we0j.agent.context.ReminderInjector;
+import com.we0j.agent.context.ReminderStore;
+import com.we0j.agent.context.SystemPromptAssembler;
+import com.we0j.agent.context.contributors.AgentsMdContributor;
+import com.we0j.agent.context.contributors.BackgroundNotificationContributor;
+import com.we0j.agent.context.contributors.DeferredToolsContributor;
+import com.we0j.agent.context.contributors.FollowUpInputContributor;
+import com.we0j.agent.context.contributors.McpInstructionsContributor;
+import com.we0j.agent.context.contributors.MemoryPrefixContributor;
+import com.we0j.agent.context.contributors.PlanModeContributor;
+import com.we0j.agent.context.contributors.SkillsContributor;
+import com.we0j.agent.context.contributors.TeamContextContributor;
 import com.we0j.agent.session.MessageWithParts;
-import com.we0j.common.domain.message.AssistantMessage;
-import com.we0j.common.domain.message.UserMessage;
-import com.we0j.common.domain.part.Part;
-import com.we0j.common.domain.part.TextPart;
-import com.we0j.common.domain.part.ToolPart;
-import com.we0j.common.domain.part.ToolState;
 import com.we0j.infra.config.Settings;
+import com.we0j.infra.concurrency.RuntimeLane;
 import com.we0j.llm.spi.CacheStrategy;
 import com.we0j.llm.spi.ChatRequest;
-import com.we0j.llm.spi.ContentBlock;
 import com.we0j.llm.spi.ModelCard;
-import com.we0j.llm.spi.ProviderMessage;
 import com.we0j.llm.spi.PromptBlock;
+import com.we0j.llm.spi.ProviderMessage;
 import com.we0j.llm.spi.ToolDefinition;
 import com.we0j.llm.token.ContextWindowResolver;
+import java.nio.file.Path;
 import java.util.ArrayList;
 import java.util.List;
-import java.util.Map;
+import java.util.function.Function;
+import java.util.function.Supplier;
 
 /**
- * 最小上下文装配（DDD §5.4 / FR-041 的 M1 子集 + M2 工具 schema 接入）：历史 → ChatRequest。
+ * 上下文装配门面（DDD §5.4 / FR-04，M3 完整版）：历史 + 会话上下文 → ChatRequest。
  *
- * <p>M2 增量：{@link #assemble(String, List, ModelCard, Settings, List)} 接受 ToolResolver 解析后的
- * 工具定义列表挂到 ChatRequest.tools（AgentLoop 步骤 8 经 resolver 得到非 lazy 子集；
- * deferred 名字的 reminder 渲染随 M2+ DeferredToolsContributor 落地）。
+ * <p>装配流水线：SystemPromptAssembler（6 块稳定前缀）→ ReminderInjector（ContextContributor
+ * SPI 链，§5.4.2）→ HistoryConverter（Part→ContentBlock 折叠 + synthetic reminder 挂载，
+ * §5.4.3）→ MessageNormalizer（孤儿修复 / 交替合并 / provider 清洗）。
  *
- * <p>仍属 M1 范围：单 system 块（无 contributor 链 / AGENTS.md / skills 注入，TODO M2）；
- * cacheStrategy=DEFAULT。Reasoning 回传（Anthropic thinking signature，FR-040）M1 按任务指示简化跳过。
+ * <p>★ 公开签名与 M1 完全兼容（{@code AgentLoop} 调用点零改动）；无参构造保留可用
+ * （内装默认贡献者链 + NOOP 落库缝），Spring 风格的手工装配请走全参构造。
+ *
+ * <p><b>bootstrap 接线 TODO（交主线程，RuntimeBootstrap.init 内构造后经 AgentLoop.Deps 传入）：</b>
+ * <pre>
+ * new ContextAssembler(promptAssembler,
+ *     new ReminderInjector(contributors, new SessionServiceReminderStore(sessions)),
+ *     new HistoryConverter(new MessageNormalizer()),
+ *     projectRoot,
+ *     sid -&gt; sessions.runtimeState(sid).agentName(),      // M2 RuntimeState 人格
+ *     () -&gt; deferredNamesFromToolResolver,                 // FR-065 lazy 子集
+ *     registry -&gt; queuedInputsPerSession);                 // FR-028（可选，默认空）
+ * </pre>
+ * 默认实例的 ReminderStore 为 NOOP：persistent reminder 只在内存生效、不落库（单机 CLI 可接受，
+ * 接 SessionService 后获得 resume 完整性）。
  */
 public final class ContextAssembler {
 
-    /** 基准 system 文本（会话内字节稳定 —— G-05 缓存前缀铁律的最小形态）。 */
+    /** 基准 system 文本（M1 兼容常量；M3 起核心块由 resources/prompts/core-*.md 供给）。 */
     public static final String BASE_SYSTEM =
             "You are We0J, a helpful coding agent. Respond in the user's language.";
 
-    /** 装配统一模型请求（无工具兼容入口，M1 行为）。 */
+    private final SystemPromptAssembler promptAssembler;
+    private final ReminderInjector reminderInjector;
+    private final HistoryConverter historyConverter;
+    private final Path projectRoot;
+    private final Function<String, String> agentNameResolver;         // sessionId → RuntimeState.agentName
+    private final Supplier<List<String>> deferredToolNames;
+    private final Supplier<List<String>> mcpInstructions;
+
+    /** M1 兼容默认装配：完整 6 块 + 9 贡献者链（占位者渲染空自然跳过），NOOP 落库缝。 */
+    public ContextAssembler() {
+        this(new SystemPromptAssembler(new PromptBlockCache(), new EnvInfoRenderer()),
+                new ReminderInjector(defaultContributors(), ReminderStore.NOOP),
+                new HistoryConverter(new MessageNormalizer()),
+                null, sid -> null, List::of, List::of);
+    }
+
+    public ContextAssembler(SystemPromptAssembler promptAssembler, ReminderInjector reminderInjector,
+                            HistoryConverter historyConverter, Path projectRoot,
+                            Function<String, String> agentNameResolver,
+                            Supplier<List<String>> deferredToolNames,
+                            Supplier<List<String>> mcpInstructions) {
+        this.promptAssembler = promptAssembler;
+        this.reminderInjector = reminderInjector;
+        this.historyConverter = historyConverter;
+        this.projectRoot = projectRoot;
+        this.agentNameResolver = agentNameResolver == null ? sid -> null : agentNameResolver;
+        this.deferredToolNames = deferredToolNames == null ? List::of : deferredToolNames;
+        this.mcpInstructions = mcpInstructions == null ? List::of : mcpInstructions;
+    }
+
+    /** DDD §5.4.2 表格的 9 个默认贡献者（bootstrap 可用自维护列表覆盖）。 */
+    public static List<ContextContributor> defaultContributors() {
+        return List.of(new AgentsMdContributor(), new MemoryPrefixContributor(),
+                new DeferredToolsContributor(), new McpInstructionsContributor(),
+                new BackgroundNotificationContributor(), new SkillsContributor(),
+                new FollowUpInputContributor(), new PlanModeContributor(), new TeamContextContributor());
+    }
+
+    /** 装配统一模型请求（无工具兼容入口，M1 签名）。 */
     public ChatRequest assemble(String sessionId, List<MessageWithParts> history,
                                 ModelCard card, Settings settings) {
         return assemble(sessionId, history, card, settings, List.of());
@@ -45,14 +110,24 @@ public final class ContextAssembler {
     /** 装配统一模型请求；tools = ToolResolver.resolve 下发的定义集（已过滤 lazy）。 */
     public ChatRequest assemble(String sessionId, List<MessageWithParts> history, ModelCard card,
                                 Settings settings, List<ToolDefinition> tools) {
-        List<PromptBlock> system = List.of(new PromptBlock("core", systemText(settings), false));
-        List<ProviderMessage> messages = new ArrayList<>();
-        for (MessageWithParts mwp : history) {
-            switch (mwp.message()) {
-                case UserMessage ignored -> messages.addAll(toUser(mwp));
-                case AssistantMessage a -> messages.addAll(toAssistant(a, mwp.parts()));
-            }
-        }
+        String agentName = agentNameResolver.apply(sessionId);
+
+        // ── 1. system 前缀（6 块固定顺序 + 块级缓存，小时粒度时间） ──────────
+        List<PromptBlock> system = promptAssembler.assemble(new SystemPromptAssembler.AssembleCommand(
+                card, agentName, projectRoot, settings));
+
+        // ── 2. reminder 注入链（persistent 落库 / 非 persistent 内存附加） ────
+        ContributeContext ctx = new ContributeContext(sessionId, projectRoot, RuntimeLane.MAIN,
+                agentName, LoopMarkers.extract(history), history,
+                List.of(), List.of(), List.of(),
+                deferredToolNames.get(), mcpInstructions.get(), settings);
+        ReminderInjector.Result injected = reminderInjector.inject(ctx);
+
+        // 双源防重：本轮 history 快照已含的持久 Part（同 id）不再经 injectedReminders 重复挂载
+        List<com.we0j.common.domain.part.TextPart> pending =
+                HistoryConverter.dedupeAgainstHistory(history, concat(injected));
+        List<ProviderMessage> messages = historyConverter.convert(history, card, pending);
+
         return ChatRequest.builder()
                 .model(card)
                 .system(system)
@@ -63,62 +138,10 @@ public final class ContextAssembler {
                 .build();
     }
 
-    /** system 文本：基础句 + （若配置了）用户语言偏好。同一会话内必须字节一致（缓存稳定）。 */
-    private String systemText(Settings settings) {
-        String lang = settings == null || settings.common() == null ? null : settings.common().language();
-        if (lang == null || lang.isBlank() || "zh-CN".equalsIgnoreCase(lang)) {
-            return BASE_SYSTEM;                           // 默认语言不追加行，保证常见配置的字节稳定
-        }
-        return BASE_SYSTEM + "\nUser preferred response language: " + lang + "." + "\nWhen the user writes in another language, follow the user's language.";
-    }
-
-    private List<ProviderMessage> toUser(MessageWithParts mwp) {
-        List<ContentBlock> blocks = new ArrayList<>();
-        for (Part p : mwp.parts()) {
-            if (p instanceof TextPart tp && !Boolean.TRUE.equals(tp.ignored())
-                    && tp.text() != null && !tp.text().isBlank()) {
-                blocks.add(ContentBlock.of(tp.text()));
-            }
-            // TODO(M2): FilePart 附件 → ContentBlock.Image / 文件引用文本（§5.4.3）
-        }
-        if (blocks.isEmpty()) return List.of();
-        return List.of(ProviderMessage.user(blocks));
-    }
-
-    private List<ProviderMessage> toAssistant(AssistantMessage a, List<Part> parts) {
-        // 错误轮不回填（避免 provider 对空/坏 assistant 消息 400；M2 起按 §5.4.3 清洗策略处理）
-        if (a.error() != null) return List.of();
-        List<ContentBlock> content = new ArrayList<>();
-        List<ProviderMessage.ToolCallRef> calls = new ArrayList<>();
-        List<ProviderMessage> toolResults = new ArrayList<>();
-        for (Part p : parts) {
-            switch (p) {
-                case TextPart tp -> {
-                    if (tp.text() != null && !tp.text().isBlank()) content.add(ContentBlock.of(tp.text()));
-                }
-                // TODO(M2): ReasoningPart 回传（仅 anthropic，signature 原样携带，FR-040）
-                case ToolPart tp -> {
-                    if (tp.state() instanceof ToolState.Completed c) {
-                        calls.add(new ProviderMessage.ToolCallRef(tp.callId(), tp.toolName(),
-                                c.input(), ""));
-                        toolResults.add(ProviderMessage.toolResult(tp.callId(),
-                                List.of(ContentBlock.of(c.output() == null ? "" : c.output()))));
-                    } else if (tp.state() instanceof ToolState.Error e2) {
-                        calls.add(new ProviderMessage.ToolCallRef(tp.callId(), tp.toolName(),
-                                e2.input(), ""));
-                        toolResults.add(ProviderMessage.toolResult(tp.callId(),
-                                List.of(ContentBlock.of("[tool error] " + e2.error()))));
-                    }
-                    // pending/running：历史推导中间态，不入请求（M1 清理后不会出现）
-                }
-                default -> { }
-            }
-        }
-        List<ProviderMessage> out = new ArrayList<>();
-        if (!content.isEmpty() || !calls.isEmpty()) {
-            out.add(new ProviderMessage.Assistant(content, calls, null, Map.of()));
-        }
-        out.addAll(toolResults);
+    private static List<com.we0j.common.domain.part.TextPart> concat(ReminderInjector.Result r) {
+        List<com.we0j.common.domain.part.TextPart> out = new ArrayList<>(r.ephemeral().size() + r.persisted().size());
+        out.addAll(r.persisted());
+        out.addAll(r.ephemeral());
         return out;
     }
 }

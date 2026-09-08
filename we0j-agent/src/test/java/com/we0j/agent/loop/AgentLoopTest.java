@@ -90,11 +90,13 @@ class AgentLoopTest {
                     .filter(p -> p instanceof TextPart).map(p -> (TextPart) p).findFirst().orElseThrow();
             assertThat(tp.time().end()).isNotNull();                  // terminal 闭合
 
-            // 请求装配检查：system 单块、无工具、历史含 user 文本
+            // 请求装配检查：system 多块（core 首位，M3 起含 env/language）、无工具、历史含 user 文本
             assertThat(fake.requests()).hasSize(1);
-            assertThat(fake.lastRequest().system()).hasSize(1);
+            assertThat(fake.lastRequest().system()).isNotEmpty();
+            assertThat(fake.lastRequest().system().get(0).key()).isEqualTo("core");
             assertThat(fake.lastRequest().system().get(0).text()).contains("You are We0J");
-            assertThat(fake.lastRequest().tools()).isEmpty();
+            // M2 工具接线后 bootstrap 真实下发非 lazy 工具集（原 isEmpty() 断言已过时；M3 重跑时修正）
+            assertThat(fake.lastRequest().tools()).isNotEmpty();
             assertThat(fake.lastRequest().messages()).anySatisfy(m ->
                     assertThat(((com.we0j.llm.spi.ProviderMessage.User) m).content()).isNotEmpty());
 

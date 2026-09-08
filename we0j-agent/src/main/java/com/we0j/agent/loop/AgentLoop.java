@@ -72,7 +72,11 @@ public final class AgentLoop {
             /** M2 工具批量执行器；null = 保留 M1 占位行为（手工装配渐进接线期的 null 安全）。 */
             ToolExecutor toolExecutor,
             /** M2 工具解析器（schema 下发）；null = 本轮不下发工具（M1 行为）。 */
-            ToolResolver toolResolver) {
+            ToolResolver toolResolver,
+            /** M3 快照服务；null = 不锚定（treeHash=null）。 */
+            com.we0j.agent.snapshot.SnapshotService snapshotService,
+            /** M3 压缩服务；null = 不自动压缩（M1 行为）。 */
+            com.we0j.agent.compaction.CompactionService compactionService) {
 
         public Deps {
             if (assembler == null) assembler = new ContextAssembler();
@@ -83,7 +87,7 @@ public final class AgentLoop {
                     ModelCard card, ModelClient modelClient, CostCalculator costs, RetryScheduler retry,
                     Settings settings, ContextAssembler assembler, int maxSteps) {
             this(sessions, cache, bus, registry, card, modelClient, costs, retry, settings, assembler,
-                    maxSteps, null, null);
+                    maxSteps, null, null, null, null);
         }
     }
 
@@ -117,10 +121,11 @@ public final class AgentLoop {
                 // ── 1. 置 Busy ─────────────────────────────────────────────
                 setStatus(new SessionStatus.Busy(step, "context"));
 
-                // ── 2. 读历史 ──────────────────────────────────────────────
+                // ── 2. 读历史（M3：压缩边界过滤）──────────────────────────
                 List<MessageWithParts> all = deps.sessions().history(sessionId);
-                // TODO(M2): List<MessageWithParts> msgs = CompactedHistoryFilter.apply(all);
-                List<MessageWithParts> msgs = all;
+                List<MessageWithParts> msgs = deps.compactionService() != null
+                        ? com.we0j.agent.compaction.CompactedHistoryFilter.apply(all)
+                        : all;
 
                 // ── 3. 抽取标记（每轮重新推导，无缓存）──────────────────────
                 LoopMarkers m = LoopMarkers.extract(msgs);
@@ -152,9 +157,11 @@ public final class AgentLoop {
                 // ── 9. TODO(M2, FR-051 时机③前置复检): bundle 估算 tokens 溢出复检 ──
 
                 // ── 10. 建 AssistantMessage + StepStartPart ─────────────────
-                // TODO(M2): snapshot.track(sessionId) → treeHash 锚点（FR-101）。
+                // ── 10. 快照锚点（M4）：track() → tree hash（不 commit，FR-101）──
+                String treeHash = deps.snapshotService() != null
+                        ? deps.snapshotService().track(sessionId).orElse(null) : null;
                 AssistantMessage assistant = deps.sessions().createAssistantMessage(sessionId);
-                deps.sessions().appendPart(new StepStartPart(Ulids.next(), assistant.id(), sessionId, null));
+                deps.sessions().appendPart(new StepStartPart(Ulids.next(), assistant.id(), sessionId, treeHash));
 
                 // ── 11. 内层循环 ────────────────────────────────────────────
                 setStatus(new SessionStatus.Busy(step, "streaming"));

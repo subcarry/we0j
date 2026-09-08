@@ -379,9 +379,39 @@ public final class RuntimeBootstrap implements AutoCloseable {
                         "no default model card; set common.chat.default or pass Options.modelCardOverride"));
         int maxSteps = opts.maxStepsOverride != null ? opts.maxStepsOverride : loopMaxSteps(settings);
 
+        // ── M3 压缩 + M4 快照装配 ──────────────────────────────────────────
+        com.we0j.llm.token.TokenCounter tokenCounter = new com.we0j.llm.token.TokenCounter();
+        com.we0j.agent.snapshot.GitCliSnapshotService snapshotService =
+                new com.we0j.agent.snapshot.GitCliSnapshotService(resolver, new com.we0j.agent.snapshot.GitRunner());
+        com.we0j.agent.compaction.CompactionService compactionService =
+                new com.we0j.agent.compaction.CompactionService(
+                        new com.we0j.agent.compaction.PreservedTailPlanner(tokenCounter),
+                        new com.we0j.agent.compaction.HistorySanitizer(),
+                        new com.we0j.agent.compaction.CompactionPromptBuilder(),
+                        new com.we0j.agent.compaction.CompactionRetryPlanner(),
+                        new com.we0j.agent.compaction.PostCompactionRestore(sessions, cache),
+                        new com.we0j.agent.compaction.MicroCompactor(sessions, tokenCounter),
+                        new com.we0j.agent.compaction.ChainGuard(3),
+                        sessions, cache,
+                        (system, messages) -> {   // HiddenSessionRunner：SIDE_LLM 单轮摘要调用（泳道经 RuntimeLaneRegistry）
+                            var req = com.we0j.llm.spi.ChatRequest.builder()
+                                    .model(card).system(java.util.List.of(new com.we0j.llm.spi.PromptBlock("compaction", system, false)))
+                                    .messages(messages).cacheStrategy(com.we0j.llm.spi.CacheStrategy.LAST_USER_ONLY)
+                                    .maxOutputTokens(2048).build();
+                            StringBuilder sb = new StringBuilder();
+                            try (var stream = modelClient.openStream(req, com.we0j.infra.concurrency.AbortSignal.create())) {
+                                for (com.we0j.common.domain.event.StreamEvent e : stream) {
+                                    if (e instanceof com.we0j.common.domain.event.StreamEvent.TextDelta td) sb.append(td.text());
+                                }
+                            }
+                            return sb.toString();
+                        },
+                        tokenCounter, bus, settingsStore, cards);
+
         AgentLoopFactory loopFactory = (sid, entry) -> new AgentLoop(sid, entry,
                 new AgentLoop.Deps(sessions, cache, bus, registry, card, modelClient, costCalculator,
-                        retry, settings, null, maxSteps, toolExecutor, toolResolver));
+                        retry, settings, null, maxSteps, toolExecutor, toolResolver,
+                        snapshotService, compactionService));
         ExecutorService loopExecutor = VirtualThreadExecutors.io("we0j-loop-");
         SessionFacade facade = new SessionFacade(sessions, registry, loopFactory, loopExecutor);
 
