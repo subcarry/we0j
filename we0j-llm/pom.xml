@@ -1,0 +1,31 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<project xmlns="http://maven.apache.org/POM/4.0.0"
+         xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+         xsi:schemaLocation="http://maven.apache.org/POM/4.0.0 http://maven.apache.org/xsd/maven-4.0.0.xsd">
+    <modelVersion>4.0.0</modelVersion>
+    <parent>
+        <groupId>com.we0j</groupId>
+        <artifactId>we0j-parent</artifactId>
+        <version>0.0.1-SNAPSHOT</version>
+    </parent>
+    <artifactId>we0j-llm</artifactId>
+    <name>we0j-llm</name>
+    <dependencies>
+        <dependency>
+            <groupId>com.we0j</groupId>
+            <artifactId>we0j-common</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.we0j</groupId>
+            <artifactId>we0j-infra</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.squareup.okhttp3</groupId>
+            <artifactId>okhttp</artifactId>
+        </dependency>
+        <dependency>
+            <groupId>com.knuddels</groupId>
+            <artifactId>jtokkit</artifactId>
+        </dependency>
+    </dependencies>
+</project>
