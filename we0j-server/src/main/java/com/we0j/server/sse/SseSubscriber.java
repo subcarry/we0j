@@ -113,6 +113,10 @@ public final class SseSubscriber implements AutoCloseable {
         // 3) 泵线程：从队列取事件 → 写 SSE（阻塞写在虚拟线程上，安全）
         Thread.ofVirtual().name("we0j-sse-" + conn.id).start(() -> pump(conn));
 
+        // 3.5) 立即推一条 comment 帧：提前 flush 响应头，避免浏览器 EventSource 的 open/
+        //      首事件感知被 15s 心跳拖后（headless 实测 onopen 从 ~16s 降到 <1s）。
+        sendQuietly(emitter, SseEmitter.event().comment("open"));
+
         // 4) 心跳（共享单线程调度器；发送失败 = 连接已死）
         conn.heartbeat = scheduler.scheduleAtFixedRate(() -> {
             try {

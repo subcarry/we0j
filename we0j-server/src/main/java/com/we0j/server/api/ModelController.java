@@ -8,6 +8,7 @@ import com.we0j.server.dto.Dtos;
 import com.we0j.server.dto.ModelDto;
 import com.we0j.server.dto.ProviderDto;
 import com.we0j.server.dto.Requests;
+import java.util.List;
 import java.io.IOException;
 import java.io.UncheckedIOException;
 import java.nio.file.Path;
@@ -78,6 +79,60 @@ public class ModelController {
                     "provider not found after write: " + id);
         }
         return Dtos.provider(id, after);
+    }
+
+    /** 当前默认厂家档位（登录页初始高亮用）。 */
+    @GetMapping("/providers/default")
+    public Map<String, String> getDefault() {
+        Settings s = settings.current(projectRoot);
+        Settings.ModelRef ref = s.common() != null && s.common().chat() != null
+                ? s.common().chat().defaultModel() : null;
+        return ref == null ? Map.of()
+                : Map.of("provider", String.valueOf(ref.provider()),
+                         "model", String.valueOf(ref.model()));
+    }
+
+    /**
+     * 切换默认厂家/模型（方案：登录页厂家选择）。写回 {@code common.chat.default} +
+     * refresh 热生效：Loop 每轮从 chat.default 取卡，下一轮即用新厂家。
+     * 选中隐含启用；未配 apiKey 拒绝并提示先走 POST /providers/{id} 补 key。
+     */
+    @PostMapping("/providers/default")
+    public Map<String, String> setDefault(@RequestBody Requests.DefaultRef req) {
+        if (req == null || req.provider() == null || req.provider().isBlank()) {
+            throw ApiException.validation("provider is required");
+        }
+        Settings.ProviderConfig cfg = providersOfCurrent().get(req.provider().trim());
+        if (cfg == null) {
+            throw ApiException.validation("unknown provider: " + req.provider());
+        }
+        List<String> modelIds = cfg.models() == null ? List.of()
+                : cfg.models().stream().filter(m -> m != null && m.id() != null)
+                        .map(Settings.ModelEntry::id).toList();
+        String model = req.model() == null || req.model().isBlank() ? null : req.model().trim();
+        if (model == null && !modelIds.isEmpty()) {
+            model = modelIds.get(0);                          // 缺省取该厂家首个已配置模型
+        }
+        if (model == null) {
+            throw ApiException.validation("provider has no models configured: " + req.provider());
+        }
+        if (!modelIds.isEmpty() && !modelIds.contains(model)) {
+            throw ApiException.validation("model " + model + " not in provider " + req.provider()
+                    + " models: " + modelIds);
+        }
+        if (cfg.apiKey() == null || cfg.apiKey().isBlank()) {
+            throw ApiException.validation("provider missing apiKey, configure it first via"
+                    + " POST /api/providers/" + req.provider());
+        }
+        try {
+            if (!cfg.enabled()) {
+                SettingsWrites.updateProvider(settings, req.provider().trim(), true, null, null);
+            }
+            SettingsWrites.writeChatDefault(settings, req.provider().trim(), model);
+        } catch (IOException e) {
+            throw new UncheckedIOException("failed to write settings.json", e);
+        }
+        return Map.of("provider", req.provider().trim(), "model", model);
     }
 
     private Map<String, Settings.ProviderConfig> providersOfCurrent() {

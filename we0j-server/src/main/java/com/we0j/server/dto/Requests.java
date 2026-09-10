@@ -52,4 +52,8 @@ public final class Requests {
     /** POST /providers/{id}；null 字段 = 不修改。 */
     public record ProviderUpdate(Boolean enabled, String apiKey, String apiBase) {
     }
+
+    /** POST /providers/default：切默认厂家档位（model 缺省取该厂家首个已配置模型）。 */
+    public record DefaultRef(String provider, String model) {
+    }
 }

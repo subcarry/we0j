@@ -33,6 +33,7 @@ public class DoctorCommand implements java.util.concurrent.Callable<Integer> {
         ok &= checkTool("git", "git --version");
         ok &= checkTool("ripgrep", "rg --version");
         ok &= checkDataDirWritable();
+        ok &= checkSkills();
         ok &= checkDiskSpace();
         return ok ? 0 : 1;
     }
@@ -96,6 +97,21 @@ public class DoctorCommand implements java.util.concurrent.Callable<Integer> {
                     usable / 1e9, total / 1e9));
         }
         return fail("磁盘剩余空间", "仅 %.0fMB 可用（需 >1GB）".formatted(usable / 1e6));
+    }
+
+    /** skills 目录体检（方案 docs/03 P0）：目录存在性与可枚举性；空目录不算失败。 */
+    private boolean checkSkills() {
+        Path dir = com.we0j.infra.path.DirectoryLayout.globalSkillsDir();
+        if (!Files.isDirectory(dir)) {
+            return pass("skills 目录", "不存在（非必需，创建后热加载自动发现）：" + dir);
+        }
+        try (java.util.stream.Stream<Path> s = Files.list(dir)) {
+            long n = s.filter(p -> Files.isDirectory(p)
+                    && Files.isRegularFile(p.resolve("SKILL.md"))).count();
+            return pass("skills 目录", n + " 个 skill · " + dir);
+        } catch (IOException e) {
+            return fail("skills 目录", dir + " 不可读：" + e.getMessage());
+        }
     }
 
     private static boolean pass(String item, String detail) {

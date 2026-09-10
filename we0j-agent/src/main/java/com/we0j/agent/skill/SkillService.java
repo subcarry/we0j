@@ -63,21 +63,63 @@ public final class SkillService {
     /** 分层重扫（global → project，respect settings.code.disabledSkills）并替换快照。 */
     public List<SkillCard> refresh(Path projectRoot) {
         lastRoot = projectRoot;
-        List<String> disabled = disabledSupplier.get();
-        return store.scan(projectRoot, disabled == null ? List.of() : disabled);
+        return store.scanFor(projectRoot, disabled()).cards();
     }
 
     /**
-     * pending 脏标记 drain：有变更则重扫。Loop 在 reminder 注入点每轮调用一次
-     * （对齐原项目 skill_watcher.consume()；watcher 不可用时退化为常驻快照）。
+     * pending 脏标记 drain：有变更则对**所有已知根**重扫（C2：内容未变的根引用不动，
+     * 字节零扰动），再返回本根最新快照。避免“A 会话吃掉 B 会话的脏标记”。
      */
     public List<SkillCard> refreshIfPending(Path projectRoot) {
-        if (store.consumePendingRescan()) return refresh(projectRoot);
-        return store.all();
+        if (store.consumePendingRescan()) {
+            lastRoot = projectRoot;
+            store.rescanAll(disabled());
+        }
+        return store.cardsFor(projectRoot, disabled());
+    }
+
+    /** per-root 快照（懒扫描；缓存契约 C3 消费面）。 */
+    public List<SkillCard> snapshotFor(Path projectRoot) {
+        return store.cardsFor(projectRoot, disabled());
+    }
+
+    /** 强制刷新全部已知根（P2 手动刷新面），返回刷新根数。 */
+    public int refreshAll() {
+        return store.forceRefreshAll(disabled());
+    }
+
+    /** 扫描元数据（scannedAt/total/failed/roots）。 */
+    public SkillStore.ScanMeta scanMeta(Path projectRoot) {
+        return store.metaFor(projectRoot);
+    }
+
+    /** watcher 是否在跑（降级可观测，G4）。 */
+    public boolean watcherRunning() {
+        SkillWatcher w = watcher;
+        return w != null && w.running();
+    }
+
+    /** 当前监视根（静态 + 动态合并；watcher 未启动时退化为静态两层目录）。 */
+    public List<Path> watchedRoots(Path projectRoot) {
+        SkillWatcher w = watcher;
+        if (w != null) return w.watchedRoots();
+        List<Path> base = new java.util.ArrayList<>();
+        base.add(DirectoryLayout.globalSkillsDir());
+        if (projectRoot != null) base.add(projectRoot.resolve(".we0j/skills").toAbsolutePath().normalize());
+        return List.copyOf(base);
     }
 
     /** 启动热加载监视（两层目录递归 WatchService + 2s mtime 指纹兜底）。幂等重启。 */
     public void startWatcher(Path projectRoot) {
+        startWatcher(projectRoot, null);
+    }
+
+    /**
+     * 启动监视并接入动态根（P1）：每轮轮询合并 supplier 提供的活跃会话 skills 目录；
+     * supplier 可后绑定（传 holder，避免装配时序前向引用）。异常/null 退化为静态根。
+     */
+    public void startWatcher(Path projectRoot,
+                             java.util.function.Supplier<List<Path>> dynamicRoots) {
         watcherLock.lock();
         try {
             stopWatcherLocked();
@@ -85,7 +127,7 @@ public final class SkillService {
             List<Path> roots = List.of(
                     DirectoryLayout.globalSkillsDir(),
                     projectRoot == null ? Path.of(".we0j/skills") : projectRoot.resolve(".we0j/skills"));
-            watcher = new SkillWatcher(store, roots);
+            watcher = new SkillWatcher(store, roots, dynamicRoots);
             watcher.start();
         } finally {
             watcherLock.unlock();
@@ -117,8 +159,20 @@ public final class SkillService {
         return store.find(name);
     }
 
+    /** per-session 查找（C3：各取各根的快照，不互写；未扫过的根懒扫描后再查）。 */
+    public Optional<SkillCard> find(Path projectRoot, String name) {
+        store.snapshotFor(projectRoot, disabled(), false);
+        return store.findIn(projectRoot, name);
+    }
+
     public List<String> names() {
         return store.names();
+    }
+
+    /** per-session 名字清单（先懒扫保证首次可见）。 */
+    public List<String> names(Path projectRoot) {
+        store.snapshotFor(projectRoot, disabled(), false);
+        return store.namesFor(projectRoot);
     }
 
     public List<SkillCard> all() {
@@ -141,5 +195,11 @@ public final class SkillService {
     /** 正文占位符展开（便捷透传）。 */
     public String expand(SkillCard card, Path workdir, String sessionId) {
         return expander.expand(card, workdir, sessionId);
+    }
+
+    /** disabled 清单归一（null → 空）。 */
+    private List<String> disabled() {
+        List<String> d = disabledSupplier.get();
+        return d == null ? List.of() : d;
     }
 }

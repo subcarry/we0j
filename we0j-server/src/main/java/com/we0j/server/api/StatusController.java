@@ -132,4 +132,18 @@ public class StatusController {
         }
         return out;
     }
+
+    /** 待办列表（Bus TodoUpdated 侧写；Todo 工具未发布的会话返回空列表）。 */
+    @GetMapping("/todos")
+    public List<com.we0j.common.domain.task.TodoItem> todos(@PathVariable String id) {
+        access.require(id);
+        return mirror.todos(id);
+    }
+
+    /** 后台任务（子 Agent / Shell，来自 Bus TaskUpdated 侧写）。 */
+    @GetMapping("/tasks")
+    public List<com.we0j.common.domain.notification.BackgroundTask> tasks(@PathVariable String id) {
+        access.require(id);
+        return mirror.tasks(id);
+    }
 }

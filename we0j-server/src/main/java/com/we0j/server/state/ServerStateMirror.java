@@ -6,6 +6,8 @@ import com.we0j.common.domain.task.TodoItem;
 import com.we0j.infra.bus.Bus;
 import com.we0j.infra.bus.BusEvent;
 import com.we0j.infra.bus.BusEvents;
+import java.util.ArrayList;
+import java.util.Comparator;
 import java.util.List;
 import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ConcurrentMap;
@@ -42,6 +44,18 @@ public final class ServerStateMirror {
 
     public List<TodoItem> todos(String sessionId) {
         return todos.getOrDefault(sessionId, List.of());
+    }
+
+    /** 该会话登记的后台任务（Agent/Shell），按创建时间升序。 */
+    public List<BackgroundTask> tasks(String sessionId) {
+        ConcurrentMap<String, BackgroundTask> map = tasks.get(sessionId);
+        if (map == null || map.isEmpty()) {
+            return List.of();
+        }
+        List<BackgroundTask> out = new ArrayList<>(map.values());
+        out.sort(Comparator.comparing(t -> t.timeCreated() == null
+                ? java.time.Instant.EPOCH : t.timeCreated()));
+        return List.copyOf(out);
     }
 
     /** 未终结（QUEUED/RUNNING）后台任务数。 */

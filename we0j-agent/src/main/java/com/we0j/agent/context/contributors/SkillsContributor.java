@@ -60,10 +60,9 @@ public final class SkillsContributor implements ContextContributor {
     public String render(ContributeContext ctx) {
         List<SkillCard> cards;
         if (service != null) {
-            // ★ Loop 在 reminder 注入点 drain 脏标记（对齐原项目 skill_watcher.consume()）：
-            //   有热加载变更则先重扫，再渲染本轮清单。
-            service.refreshIfPending(ctx == null ? null : ctx.projectRoot());
-            cards = service.all();
+            // ★ 方案 docs/03（C3）：drain 脏标记后取**本会话根**的快照，多项目会话互不覆写；
+            //   内容未变时引用短路（C2），reminder 字节恒定 → prompt cache 零扰动。
+            cards = service.refreshIfPending(ctx == null ? null : ctx.projectRoot());
         } else {
             cards = ctx == null ? List.of() : ctx.skills();
         }

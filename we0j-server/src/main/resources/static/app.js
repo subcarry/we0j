@@ -17,6 +17,10 @@ async function api(path, opts = {}) {
     opts = { ...opts, method: opts.method || "POST", body: JSON.stringify(opts.json) };
   }
   const res = await fetch(path, { ...opts, headers });
+  if (res.status === 401) { // token 失效/缺失 → 回到登录遮罩
+    localStorage.removeItem("we0j_token");
+    state.needToken = true;
+  }
   if (!res.ok) throw new Error(res.status + " " + (await res.text()).slice(0, 200));
   const ct = res.headers.get("content-type") || "";
   return ct.includes("json") ? res.json() : res.text();
@@ -49,6 +53,9 @@ const state = reactive({
   permission: null, permissionNote: "", alwaysPicks: [],
   question: null, answers: [], customs: [],
   draft: "", sending: false, error: "", sseOn: false,
+  needToken: false, tokenDraft: "", tokenBusy: false, tokenError: "",
+  authStep: "token", providers: [], provSel: "", provModel: "", provKey: "", provBase: "", defaultRef: {},
+  editId: null, editTitle: "",
 });
 const partIndex = new Map(); // partId -> { msg, idx }
 let es = null, tmpSeq = 0, lastEventSeq = 0;
@@ -84,6 +91,13 @@ function normalizePart(p) { // 服务端 Part JSON（@JsonTypeInfo: type 判别�
     default: return { ...base, kind: "other" };
   }
 }
+function applyMessageUpdate(d) { // {message} 先行于 part 事件：建档 + 权威 role（修复持久消息误渲为 assistant）
+  const m = d.message || d;
+  if (!m || !m.id) return;
+  const msg = msgOf(m.id, m.role || "assistant");
+  if (m.role) msg.role = m.role;
+  if (m.error) msg.error = m.error.message || (typeof m.error === "string" ? m.error : JSON.stringify(m.error));
+}
 function upsertPart(data) {
   const p = data.part || data;
   if (!p || !p.id) return;
@@ -94,6 +108,12 @@ function upsertPart(data) {
   if (at >= 0) msg.parts.splice(at, 1, view);
   else msg.parts.push(view);
   partIndex.set(p.id, { msg, key: view.key });
+  // 乐观去重：持久化 user 文本到达 → 移除同文本的 tmp-* 乐观消息（双显修复）
+  if (msg.role === "user" && view.kind === "text" && view.text) {
+    const i = state.messages.findIndex((m) => m.id.startsWith("tmp-") && m.role === "user"
+      && m.parts.some((x) => x.kind === "text" && x.text === view.text));
+    if (i >= 0) state.messages.splice(i, 1);
+  }
 }
 function applyDelta(data) { // {partId|id, messageId?, delta|text}
   const pid = data.partId || data.id;
@@ -106,8 +126,9 @@ function applyDelta(data) { // {partId|id, messageId?, delta|text}
   if (pid) partIndex.set(pid, { msg, key: view.key });
 }
 function loadMessages(list) {
+  const arr = Array.isArray(list) ? list : (list && list.items) || [];
   state.messages = []; partIndex.clear();
-  for (const item of list || []) {
+  for (const item of arr) {
     const m = item.message || item;
     const msg = msgOf(m.id, m.role || "assistant");
     if (m.error) msg.error = m.error.message || (typeof m.error === "string" ? m.error : JSON.stringify(m.error));
@@ -117,8 +138,8 @@ function loadMessages(list) {
 }
 
 /* ---------------- SSE ---------------- */
-const SSE_EVENTS = ["session.updated", "message.part.updated", "message.part.delta",
-  "permission.asked", "question.asked", "task.updated", "todo.updated"];
+const SSE_EVENTS = ["session.updated", "message.updated", "message.part.updated",
+  "message.part.delta", "permission.asked", "question.asked", "task.updated", "todo.updated"];
 function disconnectSSE() { if (es) { es.close(); es = null; } state.sseOn = false; }
 function connectSSE() {
   disconnectSSE();
@@ -137,6 +158,7 @@ function connectSSE() {
 }
 function onEvent(name, d) {
   switch (name) {
+    case "message.updated": applyMessageUpdate(d); break;
     case "message.part.delta": applyDelta(d); break;
     case "message.part.updated": upsertPart(d); break;
     case "session.updated": applySessionUpdate(d); break;
@@ -158,6 +180,11 @@ function applySessionUpdate(d) {
   const m = d.model || d.modelId || (d.session && (d.session.model || d.session.modelId));
   if (m) state.model = typeof m === "string" ? m : (m.id || m.modelId || m.name || state.model);
   if (d.permissionMode) state.permissionMode = d.permissionMode;
+  if (d.title) { // 他端（CLI/其它窗口）重命名 → 同步本端列表
+    const row = state.sessions.find((x) => x.id === (d.sessionId || state.currentId));
+    if (row) row.title = d.title;
+    else loadSessions();
+  }
 }
 
 /* ---------------- 动作 ---------------- */
@@ -166,13 +193,79 @@ function scrollBottom() { if (scroller) scroller.scrollTop = scroller.scrollHeig
 function sid() { return encodeURIComponent(state.currentId); }
 function fail(e) { state.error = String(e.message || e); setTimeout(() => (state.error = ""), 6000); }
 
+/* ---------------- token 登录 ---------------- */
+async function submitToken() {
+  const t = state.tokenDraft.trim();
+  if (!t || state.tokenBusy) return;
+  state.tokenBusy = true; state.tokenError = "";
+  localStorage.setItem("we0j_token", t);
+  try {
+    await api("/api/sessions");            // 验证接口：2xx 即 token 有效
+    state.tokenDraft = ""; state.tokenBusy = false;
+    await enterProviderStep();             // 步骤 2：API 厂家选择
+  } catch (e) {
+    localStorage.removeItem("we0j_token");
+    state.tokenError = "token 无效：" + (e.message || e);
+    state.needToken = true; state.authStep = "token";
+  } finally { state.tokenBusy = false; }
+}
+/* ---- 登录步骤 2：厂家选择（加载失败不阻塞，直接放行） ---- */
+async function enterProviderStep() {
+  try {
+    const [ps, dft] = await Promise.all([api("/api/providers"), api("/api/providers/default")]);
+    state.providers = Array.isArray(ps) ? ps : [];
+    state.defaultRef = dft || {};
+    const hit = state.providers.find((p) => p.id === (dft && dft.provider));
+    state.provSel = hit ? hit.id : "";
+    syncProvModel();
+    state.needToken = true; state.authStep = "provider";
+  } catch (e) { finishAuth(); }
+}
+function selectedProvider() {
+  return state.providers.find((p) => p.id === state.provSel) || null;
+}
+function syncProvModel() {
+  const pr = selectedProvider();
+  const ms = pr && pr.models ? pr.models : [];
+  state.provModel = ms.includes(state.provModel) ? state.provModel : (ms[0] || "");
+}
+function pickProvider(p) {
+  state.provSel = p.id; state.tokenError = "";
+  syncProvModel();
+}
+async function applyProviderEnter() {
+  if (!state.provSel) { finishAuth(); return; }
+  state.tokenBusy = true; state.tokenError = "";
+  try {
+    const body = {};
+    if (state.provKey.trim()) { body.apiKey = state.provKey.trim(); body.enabled = true; }
+    if (state.provBase.trim()) body.apiBase = state.provBase.trim();
+    if (Object.keys(body).length) {
+      await api("/api/providers/" + encodeURIComponent(state.provSel), { method: "POST", json: body });
+    }
+    await api("/api/providers/default", { method: "POST",
+      json: { provider: state.provSel, model: state.provModel || undefined } });
+    localStorage.setItem("we0j_provider", state.provSel + "/" + state.provModel);
+    finishAuth();
+  } catch (e) {
+    state.tokenError = "应用失败：" + (e.message || e);
+    state.tokenBusy = false;
+  }
+}
+function finishAuth() {
+  state.needToken = false; state.authStep = "token"; state.tokenBusy = false; state.tokenError = "";
+  loadSessions(); loadModels();
+}
+
 async function loadSessions() {
   try {
     const list = await api("/api/sessions");
-    state.sessions = (Array.isArray(list) ? list : list.sessions || []).map((s) => ({
+    const rows = Array.isArray(list) ? list : (list.items || list.sessions || []);
+    state.sessions = rows.map((s) => ({
       id: s.id || s.sessionId,
-      title: s.title || s.name || (s.workdir || "").split(/[\\/]/).pop() || (s.id || "").slice(0, 8),
-      workdir: s.workdir,
+      title: s.title || s.name || (s.directory || s.workdir || "").split(/[\\/]/).pop() || (s.id || "").slice(0, 8),
+      workdir: s.directory || s.workdir,
+      status: s.status,
     }));
     if (!state.currentId && state.sessions.length) selectSession(state.sessions[0].id);
   } catch (e) { fail(e); }
@@ -187,6 +280,27 @@ async function selectSession(id) {
   if (state.panel) loadPanel(state.panel);
 }
 function onPickSession() { selectSession(state.currentId); }
+/* ---------------- 重命名会话 ---------------- */
+function startRename(s) {
+  state.editId = s.id; state.editTitle = s.title;
+  nextTick(() => {
+    const el = document.querySelector(".rename-input");
+    if (el && state.editId === s.id) { el.focus(); el.select(); }
+  });
+}
+function cancelRename() { state.editId = null; state.editTitle = ""; }
+async function commitRename() {
+  const id = state.editId;
+  if (!id) return; // Enter 提交后 blur 会二次触发，此时已结束编辑
+  const row = state.sessions.find((x) => x.id === id);
+  const title = state.editTitle.trim();
+  state.editId = null; state.editTitle = "";
+  if (!row || !title || title === row.title) return;
+  try {
+    await api("/api/sessions/" + encodeURIComponent(id) + "/rename", { method: "POST", json: { title } });
+    row.title = title; // 顶栏下拉框与列表同源，自动刷新
+  } catch (e) { fail(e); }
+}
 async function newSession() {
   const workdir = window.prompt("工作目录 workdir（可空则用服务端默认）", "");
   if (workdir === null) return;
@@ -241,7 +355,7 @@ async function replyQuestion(answers) {
 }
 
 /* ---------------- 面板 / 顶栏 ---------------- */
-const PANELS = { status: "状态", todos: "Todos", tasks: "Tasks", tools: "工具", model: "模型" };
+const PANELS = { status: "状态", todos: "Todos", tasks: "Tasks", tools: "工具", skills: "Skills", model: "模型" };
 function togglePanel(p) {
   state.panel = state.panel === p ? null : p;
   if (state.panel) loadPanel(p);
@@ -253,6 +367,7 @@ async function loadPanel(p) {
     else if (p === "todos") state.panelData.todos = await api("/api/sessions/" + sid() + "/todos");
     else if (p === "tasks") state.panelData.tasks = await api("/api/sessions/" + sid() + "/tasks");
     else if (p === "tools") state.panelData.tools = await api("/api/sessions/" + sid() + "/tools");
+    else if (p === "skills") state.panelData.skills = await api("/api/skills?sessionId=" + sid());
   } catch (e) { state.panelData[p] = []; if (p !== "status") fail(e); }
 }
 async function refreshStatus() {
@@ -267,7 +382,10 @@ async function loadModels() {
   try {
     const d = await api("/api/models");
     state.models = (Array.isArray(d) ? d : d.models || []).map((m) =>
-      typeof m === "string" ? { id: m, name: m } : { id: m.id || m.modelId, name: m.name || m.id, provider: m.provider });
+      typeof m === "string" ? { id: m, name: m }
+        : { id: m.qualifiedId || m.id || m.modelId,
+            name: m.name || m.qualifiedId || (m.providerId ? m.providerId + "/" + m.model : m.model || m.id),
+            provider: m.provider || m.providerId });
     if (!state.model && d.current) state.model = d.current.id || d.current;
   } catch (e) { fail(e); }
 }
@@ -282,15 +400,30 @@ async function setPermissionMode() {
   catch (e) { /* 端点未实现时静默 */ }
 }
 
+async function refreshSkills() {
+  try {
+    const r = await api("/api/skills/refresh?sessionId=" + sid(), { method: "POST" });
+    state.panelData.skills = r.snapshot || r;
+  } catch (e) { fail(e); }
+}
+
 /* ---------------- Vue 应用 ---------------- */
 createApp({
   setup() {
-    onMounted(() => { loadSessions(); loadModels(); });
+    onMounted(() => {
+      if (!token()) { state.needToken = true; return; } // 无 token → 弹登录遮罩，验证通过再拉数据
+      loadSessions(); loadModels();
+    });
     return {
       // 状态（reactive 直接展开）
       ...Vue.toRefs(state),
       panels: Object.keys(PANELS), panelLabels: PANELS,
       // computed
+      selectedProvider: computed(() => selectedProvider()),
+      needKeyInput: computed(() => {
+        const pr = selectedProvider();
+        return !!pr && !pr.apiKeyMasked;
+      }),
       statusText: computed(() => {
         const map = { idle: "空闲", busy: "运行中", retry: "重试", compacting: "压缩中", cancelled: "已停止" };
         return map[state.status] || state.status;
@@ -304,8 +437,14 @@ createApp({
       }),
       // 动作
       md: mdLite, onPickSession, selectSession, newSession, send, cancel, onKeydown,
-      replyPermission, replyQuestion, togglePanel, setModel, setPermissionMode,
+      replyPermission, replyQuestion, togglePanel, setModel, setPermissionMode, submitToken,
+      startRename, commitRename, cancelRename, refreshSkills,
+      pickProvider, applyProviderEnter, finishAuth,
     };
   },
-  mounted() { scroller = this.$refs.scroller; inputEl = this.$refs.input; scrollBottom(); },
+  mounted() {
+    scroller = this.$refs.scroller; inputEl = this.$refs.input;
+    if (state.needToken && this.$refs.tokenInput) nextTick(() => this.$refs.tokenInput.focus());
+    scrollBottom();
+  },
 }).mount("#app");

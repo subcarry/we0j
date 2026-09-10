@@ -138,4 +138,9 @@ public class We0jServerApplication {
     public ToolResolver toolResolver(RuntimeBootstrap bs) {
         return bs.toolResolver();
     }
+
+    @Bean
+    public com.we0j.agent.skill.SkillService skillService(RuntimeBootstrap bs) {
+        return bs.skillService();
+    }
 }

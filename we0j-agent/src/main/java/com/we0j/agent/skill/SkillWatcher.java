@@ -41,6 +41,8 @@ public final class SkillWatcher {
 
     private final SkillStore store;
     private final List<Path> roots;
+    /** 动态根 supplier（方案 P1：活跃会话 workdir/.we0j/skills 等，每轮合并）。可空。 */
+    private final java.util.function.Supplier<List<Path>> dynamicRoots;
 
     private final AtomicBoolean dirty = new AtomicBoolean(false);
     private final ConcurrentHashMap<WatchKey, Path> keys = new ConcurrentHashMap<>();
@@ -58,12 +60,47 @@ public final class SkillWatcher {
      * @param roots 监视根（global skills 目录 + 项目 .we0j/skills；可含不存在的路径，运行期补注册）
      */
     public SkillWatcher(SkillStore store, List<Path> roots) {
+        this(store, roots, null);
+    }
+
+    /**
+     * @param store         命中变更后置脏标记的 store
+     * @param roots         静态监视根（global skills + 启动根 .we0j/skills；可含不存在路径）
+     * @param dynamicRoots  动态根 supplier（每轮轮询合并；null = 无）
+     */
+    public SkillWatcher(SkillStore store, List<Path> roots,
+                        java.util.function.Supplier<List<Path>> dynamicRoots) {
         this.store = store;
         List<Path> r = new ArrayList<>();
         if (roots != null) {
             for (Path p : roots) if (p != null) r.add(p.toAbsolutePath().normalize());
         }
         this.roots = List.copyOf(r);
+        this.dynamicRoots = dynamicRoots;
+    }
+
+    /** 静态 + 动态合并后的当前监视面（异常退化为静态 roots）。 */
+    private List<Path> mergedRoots() {
+        java.util.LinkedHashSet<Path> all = new java.util.LinkedHashSet<>(roots);
+        java.util.function.Supplier<List<Path>> sup = dynamicRoots;
+        if (sup != null) {
+            try {
+                List<Path> dyn = sup.get();
+                if (dyn != null) {
+                    for (Path p : dyn) {
+                        if (p != null) all.add(p.toAbsolutePath().normalize());
+                    }
+                }
+            } catch (RuntimeException e) {
+                log.debug("skill watcher dynamic roots failed", e);
+            }
+        }
+        return List.copyOf(all);
+    }
+
+    /** 当前监视根快照（可观测性消费：/api/skills 面板）。 */
+    public List<Path> watchedRoots() {
+        return mergedRoots();
     }
 
     public void start() {
@@ -151,7 +188,7 @@ public final class SkillWatcher {
     // ── WatchService 注册 ───────────────────────────────────────────────────
 
     private void registerAll() throws IOException {
-        for (Path root : roots) {
+        for (Path root : mergedRoots()) {
             if (!Files.isDirectory(root)) continue;
             try (Stream<Path> walk = Files.walk(root)) {
                 for (Path dir : walk.filter(Files::isDirectory).toList()) {
@@ -166,7 +203,7 @@ public final class SkillWatcher {
         WatchService ws = watcher;
         if (ws == null) return;
         try {
-            for (Path root : roots) {
+            for (Path root : mergedRoots()) {
                 if (!Files.isDirectory(root)) continue;
                 try (Stream<Path> walk = Files.walk(root)) {
                     for (Path dir : walk.filter(Files::isDirectory).toList()) {
@@ -208,7 +245,7 @@ public final class SkillWatcher {
     /** 目录树指纹：相对路径 + mtimeMillis 排序拼接的 SHA-256；缺失目录以 <missing> 参与。 */
     private String safeFingerprint() {
         StringBuilder sb = new StringBuilder();
-        for (Path root : roots) {
+        for (Path root : mergedRoots()) {
             List<String> entries = new ArrayList<>();
             if (Files.isDirectory(root)) {
                 try (Stream<Path> walk = Files.walk(root)) {

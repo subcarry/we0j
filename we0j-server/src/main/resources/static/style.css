@@ -16,11 +16,11 @@ body { font-family: ui-sans-serif, system-ui, "Segoe UI", sans-serif; }
 hr { border-color: var(--border); }
 
 /* 控件 */
-.ui-select, .ui-textarea, .ui-btn {
+.ui-select, .ui-textarea, .ui-btn, .ui-input {
   background: var(--bg); color: var(--fg); border: 1px solid var(--border);
   border-radius: 6px; padding: 4px 8px; outline: none; font-size: 12px;
 }
-.ui-select:focus, .ui-textarea:focus { border-color: var(--blue); }
+.ui-select:focus, .ui-textarea:focus, .ui-input:focus { border-color: var(--blue); }
 .ui-btn { cursor: pointer; background: var(--panel); }
 .ui-btn:hover { border-color: var(--fg-dim); }
 .ui-btn.active { color: var(--blue); border-color: var(--blue); }
@@ -48,6 +48,11 @@ hr { border-color: var(--border); }
 .session-item { padding: 6px 8px; border-radius: 6px; cursor: pointer;
   border: 1px solid transparent; }
 .session-item:hover { background: #1f2630; }
+.rename-btn { border: none; background: none; color: #8b949e; cursor: pointer;
+  font-size: 12px; padding: 0 4px; border-radius: 4px; opacity: 0; flex-shrink: 0; }
+.session-item:hover .rename-btn { opacity: .65; }
+.rename-btn:hover { opacity: 1 !important; background: #2b3340; color: #e6edf3; }
+.rename-input { font-size: 12px; margin-bottom: 2px; }
 .session-item.active { background: #1f2630; border-color: var(--border); }
 
 /* 消息流 */

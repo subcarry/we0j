@@ -53,6 +53,17 @@ public final class SettingsWrites {
         });
     }
 
+    /** 写 {@code common.chat.default = {provider, model}}（登录页厂家切换；Loop 下一轮热生效）。 */
+    public static void writeChatDefault(SettingsStore store, String providerId, String model)
+            throws IOException {
+        mutate(store, root -> {
+            ObjectNode chat = childObject(childObject(root, "common"), "chat");
+            ObjectNode def = childObject(chat, "default");
+            def.put("provider", providerId);
+            def.put("model", model);
+        });
+    }
+
     @FunctionalInterface
     private interface Editor {
         void apply(ObjectNode root);

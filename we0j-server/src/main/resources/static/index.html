@@ -4,12 +4,60 @@
 <meta charset="UTF-8">
 <meta name="viewport" content="width=device-width, initial-scale=1.0">
 <title>We0J Console</title>
-<script src="https://unpkg.com/vue@3/dist/vue.global.prod.js"></script>
-<script src="https://cdn.tailwindcss.com"></script>
+<script src="vendor/vue.global.prod.js"></script>
+<script src="vendor/tailwind.js"></script>
 <link rel="stylesheet" href="style.css">
 </head>
 <body class="dark">
 <div id="app" v-cloak class="h-screen flex flex-col text-sm">
+
+  <!-- ======== 登录遮罩：步骤1 token → 步骤2 API 厂家 ======== -->
+  <div v-if="needToken" class="fixed inset-0 z-50 flex items-center justify-center bg-black/85">
+    <div class="w-[26rem] max-w-[92vw] rounded-lg border border-gray-700 bg-panel p-5 space-y-3 shadow-2xl">
+
+      <template v-if="authStep === 'token'">
+        <div class="text-base font-bold text-emerald-400">We0J 控制台 · 身份验证</div>
+        <p class="text-gray-400 text-xs leading-5">请输入访问 token（见 <code class="inline-code">~/.we0j/settings.json</code> 的 <code class="inline-code">web.token</code>，或启动服务时 CLI 打印的带 token 的 URL）。</p>
+        <input ref="tokenInput" v-model="tokenDraft" type="password" class="ui-input w-full px-2 py-1.5 rounded"
+               placeholder="wjk_..." @keydown.enter="submitToken" @keydown.esc="tokenDraft = ''">
+        <div v-if="tokenError" class="text-red-400 text-xs">{{ tokenError }}</div>
+        <button class="ui-btn primary w-full py-1.5 rounded" :disabled="tokenBusy" @click="submitToken">
+          {{ tokenBusy ? "验证中…" : "下一步：选择 API 厂家" }}
+        </button>
+        <p class="text-gray-600 text-[11px]">也可访问 <code class="inline-code">/?token=xxx</code> 自动保存。</p>
+      </template>
+
+      <template v-else>
+        <div class="text-base font-bold text-emerald-400">We0J 控制台 · API 厂家</div>
+        <p class="text-gray-400 text-xs leading-5">选择本次使用的厂家与模型（写入默认档位，下一轮对话即生效；也可保持现状进入）。</p>
+        <div class="grid grid-cols-2 gap-2">
+          <button v-for="p in providers" :key="p.id" class="ui-btn text-left px-2 py-1.5 rounded"
+                  :class="{ primary: provSel === p.id }" @click="pickProvider(p)">
+            <div class="flex justify-between items-center gap-1">
+              <b class="truncate">{{ p.id }}</b>
+              <span v-if="defaultRef.provider === p.id" class="text-[10px] text-emerald-300 shrink-0">当前默认</span>
+              <span v-else-if="!p.apiKeyMasked" class="text-[10px] text-amber-400 shrink-0">缺 Key</span>
+              <span v-else-if="!p.enabled" class="text-[10px] text-gray-500 shrink-0">未启用</span>
+            </div>
+            <div class="text-[10px] opacity-70 truncate">{{ p.family || 'openai-compatible' }} · {{ (p.models || []).length }} 模型</div>
+          </button>
+        </div>
+        <select v-if="provSel && (selectedProvider.models || []).length" class="ui-select w-full" v-model="provModel">
+          <option v-for="m in selectedProvider.models" :key="m" :value="m">{{ m }}</option>
+        </select>
+        <template v-if="needKeyInput">
+          <input v-model="provBase" class="ui-input w-full px-2 py-1.5 rounded" placeholder="apiBase（如 https://api.example.com/v1，可空用厂家默认）">
+          <input v-model="provKey" type="password" class="ui-input w-full px-2 py-1.5 rounded" placeholder="API Key（必填，仅写入本地 settings.json）">
+        </template>
+        <div v-if="tokenError" class="text-red-400 text-xs">{{ tokenError }}</div>
+        <button class="ui-btn primary w-full py-1.5 rounded" :disabled="tokenBusy" @click="applyProviderEnter">
+          {{ tokenBusy ? "应用中…" : "应用并进入控制台" }}
+        </button>
+        <button class="ui-btn w-full py-1.5 rounded" :disabled="tokenBusy" @click="finishAuth">保持当前默认，直接进入</button>
+      </template>
+
+    </div>
+  </div>
 
   <!-- ======== 顶栏 ======== -->
   <header class="topbar h-12 shrink-0 flex items-center gap-3 px-3">
@@ -44,7 +92,14 @@
         <li v-for="s in sessions" :key="s.id"
             class="session-item" :class="{ active: s.id === currentId }"
             @click="selectSession(s.id)">
-          <div class="truncate">{{ s.title }}</div>
+          <div class="flex items-center gap-1">
+            <div class="truncate flex-1">{{ editId === s.id ? '' : s.title }}</div>
+            <button v-show="editId !== s.id" class="rename-btn"
+                    title="重命名" @click.stop="startRename(s)">✎</button>
+          </div>
+          <input v-if="editId === s.id" v-model="editTitle" class="rename-input ui-textarea px-1 py-0.5"
+                 @click.stop @keydown.enter.prevent="commitRename" @keydown.esc.prevent="cancelRename"
+                 @blur="commitRename">
           <div class="text-xs text-gray-500 truncate">{{ s.workdir || s.id }}</div>
         </li>
         <li v-if="!sessions.length" class="text-gray-600 p-2">暂无会话</li>
@@ -158,12 +213,15 @@
       <div v-else-if="panel === 'tasks'" class="space-y-2">
         <div v-for="t in panelData.tasks || []" :key="t.id" class="task-card">
           <div class="flex justify-between">
-            <b>{{ t.subject }}</b><span class="text-xs" :class="'text-' + String(t.status||'').toLowerCase()">{{ t.status }}</span>
+            <b>{{ t.description || (String(t.type || '').toLowerCase() + ':' + String(t.id || '').slice(-6)) }}</b>
+            <span class="text-xs" :class="'text-' + String(t.status||'').toLowerCase()">{{ t.status }}</span>
           </div>
           <div class="text-xs text-gray-500">
-            <span v-if="t.owner">owner: {{ t.owner }}</span>
-            <span v-if="(t.openBlockedBy || []).length"> · blockedBy: {{ t.openBlockedBy.join(', ') }}</span>
+            <span v-if="t.type">{{ String(t.type).toLowerCase() }}</span>
+            <span v-if="t.toolCallCount != null"> · calls: {{ t.toolCallCount }}</span>
+            <span v-if="t.tokensUsed"> · tokens: {{ t.tokensUsed }}</span>
           </div>
+          <div v-if="t.summary" class="text-xs text-gray-400 truncate">{{ t.summary }}</div>
         </div>
         <div v-if="!(panelData.tasks || []).length" class="text-gray-600">无 tasks</div>
       </div>
@@ -174,6 +232,30 @@
           <div class="text-xs text-gray-500">{{ tl.description }}</div>
         </div>
         <div v-if="!(panelData.tools || []).length" class="text-gray-600">无工具信息</div>
+      </div>
+
+      <div v-else-if="panel === 'skills'" class="space-y-2">
+        <div class="flex items-center justify-between text-xs">
+          <span class="status-pill" :class="(panelData.skills || {}).watcherRunning ? 'st-idle' : 'st-cancelled'">
+            <i class="dot"></i>{{ (panelData.skills || {}).watcherRunning ? '热加载监视中' : 'watcher 未运行' }}
+          </span>
+          <button class="ui-btn" @click="refreshSkills" title="强制重扫全部已知根">⟳ 刷新</button>
+        </div>
+        <div v-if="panelData.skills" class="text-[11px] text-gray-500 leading-4">
+          根: <span class="font-mono">{{ panelData.skills.root || '-' }}</span><br>
+          扫描于 {{ String(panelData.skills.scannedAt || '').replace('T', ' ').slice(0, 19) }} · 共 {{ panelData.skills.total }} 个
+        </div>
+        <div v-for="(f, i) in (panelData.skills || {}).failed || []" :key="'f'+i" class="part-error text-xs">⚠ {{ f }}</div>
+        <div v-for="s in (panelData.skills || {}).skills || []" :key="s.name" class="tool-info">
+          <b class="font-mono text-emerald-300">{{ s.name }}</b>
+          <span class="text-[10px] px-1 rounded ml-1"
+                :class="s.source === 'global' ? 'text-gray-400 border border-gray-700' : 'text-blue-300 border border-blue-900'">{{ s.source }}</span>
+          <div class="text-xs text-gray-500" :title="s.description">{{ (s.description || '').slice(0, 120) }}</div>
+        </div>
+        <div v-if="!((panelData.skills || {}).skills || []).length" class="text-gray-600">无 skills</div>
+        <div v-if="((panelData.skills || {}).watchedRoots || []).length" class="text-[10px] text-gray-600">
+          监视: <span v-for="(w, i) in (panelData.skills || {}).watchedRoots || []" :key="i">{{ w }}{{ i &lt; ((panelData.skills || {}).watchedRoots || []).length - 1 ? ' · ' : '' }}</span>
+        </div>
       </div>
 
       <div v-else-if="panel === 'model'" class="space-y-1">

@@ -54,21 +54,38 @@ public final class SkillScanner {
      * @param disabled    settings.code.disabledSkills（可空）
      */
     public List<SkillCard> scan(Path projectRoot, List<String> disabled) {
+        return scanOutcome(projectRoot, disabled).cards();
+    }
+
+    /** 分层扫描 + 失败收集（P3）；failed 已渲染为可读字符串，按目录去重限频 WARN。 */
+    public ScanOutcome scanOutcome(Path projectRoot, List<String> disabled) {
         Map<String, SkillCard> byName = new LinkedHashMap<>();
         Set<String> disabledSet = disabled == null ? Set.of() : Set.copyOf(disabled);
+        List<String> failed = new ArrayList<>();
 
         // 1) 全局（低优先级）
-        for (SkillCard c : scanDir(globalSkillsDir.get())) byName.put(c.name(), c);
+        for (SkillCard c : scanDir(globalSkillsDir.get(), failed)) byName.put(c.name(), c);
         // 2) 项目（覆盖同名）
         if (projectRoot != null) {
-            for (SkillCard c : scanDir(projectRoot.resolve(".we0j/skills"))) byName.put(c.name(), c);
+            for (SkillCard c : scanDir(projectRoot.resolve(".we0j/skills"), failed)) byName.put(c.name(), c);
         }
 
         disabledSet.forEach(byName::remove);
-        return List.copyOf(byName.values());
+        return new ScanOutcome(List.copyOf(byName.values()), List.copyOf(failed));
     }
 
-    private List<SkillCard> scanDir(Path dir) {
+    /** 本次扫描实际覆盖的目录（供 ScanMeta.roots / 面板展示；含不存在路径）。 */
+    public List<Path> rootsOf(Path projectRoot) {
+        List<Path> out = new ArrayList<>();
+        out.add(globalSkillsDir.get());
+        if (projectRoot != null) out.add(projectRoot.resolve(".we0j/skills").toAbsolutePath().normalize());
+        return List.copyOf(out);
+    }
+
+    /** 单次扫描结果：卡片清单 + 失败描述（"dirName: reason"）。 */
+    public record ScanOutcome(List<SkillCard> cards, List<String> failed) {}
+
+    private List<SkillCard> scanDir(Path dir, List<String> failedOut) {
         if (dir == null || !Files.isDirectory(dir)) return List.of();
         List<SkillCard> out = new ArrayList<>();
         try (Stream<Path> s = Files.list(dir)) {
@@ -93,13 +110,25 @@ public final class SkillScanner {
                     }
                     out.add(card);
                 } catch (Exception e) {
-                    log.warn("failed to parse skill {}: {}", md, e.getMessage());
+                    String reason = "parse failed: " + e.getMessage();
+                    failedOut.add(dirName(skillDir) + ": " + reason);
+                    warnThrottled(md, reason);
                 }
             }
         } catch (IOException e) {
-            log.warn("cannot list skills dir {}: {}", dir, e.getMessage());
+            failedOut.add(dir + ": cannot list dir (" + e.getMessage() + ")");
+            warnThrottled(dir, "cannot list skills dir: " + e.getMessage());
         }
         return out;
+    }
+
+    /** 同一目录同一原因只 WARN 一次（原因变化重新告警；限频面）。 */
+    private final java.util.concurrent.ConcurrentMap<String, String> warned = new java.util.concurrent.ConcurrentHashMap<>();
+
+    private void warnThrottled(Path target, String reason) {
+        if (warned.put(target.toString(), reason) == null) {
+            log.warn("skill scan: {} → {}", target, reason);
+        }
     }
 
     private static String dirName(Path skillDir) {

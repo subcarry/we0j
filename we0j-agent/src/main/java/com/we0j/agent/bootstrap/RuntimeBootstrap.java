@@ -279,9 +279,17 @@ public final class RuntimeBootstrap implements AutoCloseable {
                     return s != null && s.code() != null && s.code().disabledSkills() != null
                             ? s.code().disabledSkills() : List.of();
                 });
+        // P1（方案 docs/03）：动态根后绑定 holder——registry/sessions 尚未装配，下方就绪后 set
+        //（同 spawnerRef 迟到接线惯例；声明在此处是为了保持 effectively final 供 lambda 捕获）。
+        final java.util.concurrent.atomic.AtomicReference<
+                java.util.function.Supplier<List<java.nio.file.Path>>> skillDirsHook =
+                new java.util.concurrent.atomic.AtomicReference<>();
         try {
             skillService.refresh(root);
-            skillService.startWatcher(root);
+            skillService.startWatcher(root, () -> {
+                var s = skillDirsHook.get();
+                return s == null ? List.<java.nio.file.Path>of() : s.get();
+            });
         } catch (RuntimeException e) {
             log.warn("skills init degraded (scan/watch failed): {}", e.toString());
         }
@@ -457,15 +465,24 @@ public final class RuntimeBootstrap implements AutoCloseable {
             @Override
             public com.we0j.tool.spi.SkillLookup skillLookup(String sessionId) {
                 // FR-080 工具缝：SKILL 卡片读 SkillService 快照；invokedSkills 落 RuntimeState（压缩后恢复）。
+                // 方案 docs/03 C3：按会话 workdir 取 per-root 快照，多项目会话互不覆写。
                 return new com.we0j.tool.spi.SkillLookup() {
+                    private java.nio.file.Path sessionRoot() {
+                        try {
+                            return java.nio.file.Path.of(sessions.requireRow(sessionId).getDirectory());
+                        } catch (RuntimeException e) {
+                            return skillService.lastRoot();   // 行不可达：退化最近扫描根
+                        }
+                    }
+
                     @Override
                     public java.util.Optional<com.we0j.common.domain.skill.SkillCard> find(String name) {
-                        return skillService.find(name);
+                        return skillService.find(sessionRoot(), name);
                     }
 
                     @Override
                     public List<String> names() {
-                        return skillService.names();
+                        return skillService.names(sessionRoot());
                     }
 
                     @Override
@@ -528,6 +545,26 @@ public final class RuntimeBootstrap implements AutoCloseable {
                             return sb.toString();
                         },
                         tokenCounter, bus, settingsStore, cards);
+
+        // ── P1 动态根接线：watcher 同时监视活跃会话 workdir 的 .we0j/skills（G1 根治）──
+        final java.util.concurrent.ConcurrentMap<String, java.nio.file.Path> skillWorkdirMemo =
+                new java.util.concurrent.ConcurrentHashMap<>();
+        skillDirsHook.set(() -> {
+            List<java.nio.file.Path> dirs = new ArrayList<>();
+            for (SessionRegistry.SessionEntry e : registry.all()) {
+                java.nio.file.Path wd = skillWorkdirMemo.computeIfAbsent(e.sessionId(), sid -> {
+                    try {
+                        return java.nio.file.Path.of(sessions.requireRow(sid).getDirectory());
+                    } catch (RuntimeException ex) {
+                        return null;                             // 未命中不缓存，下轮重试
+                    }
+                });
+                if (wd != null) {
+                    dirs.add(wd.resolve(".we0j/skills"));
+                }
+            }
+            return dirs;
+        });
 
         // ── M4 skills 接线：带 SkillService 的贡献者链（SkillsContributor 真实渲染 + reminder 注入点
         // drain 热加载）。其余行为与 AgentLoop 默认 new ContextAssembler() 一致（NOOP 落库缝）。

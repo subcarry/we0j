@@ -106,7 +106,7 @@ public final class SlashCommandRegistry {
 
     public static List<SlashCommand> defaultCommands() {
         return List.of(new Help(), new Exit(), new NewSession(), new Compact(), new Rewind(),
-                new Status(), new Todos(), new Tasks(), new Model(), new Mcp(), new Usage(),
+                new Status(), new Todos(), new Tasks(), new Skills(), new Model(), new Mcp(), new Usage(),
                 new Cancel());
     }
 
@@ -276,6 +276,36 @@ public final class SlashCommandRegistry {
                 case SessionStatus.Cancelled c -> "cancelled";
                 case SessionStatus.Idle i -> "idle";
             };
+        }
+    }
+
+    /** /skills —— 本会话 skills 快照与热加载状态；reload 强制重扫（方案 docs/03 P0/P2）。 */
+    public record Skills() implements SlashCommand {
+        @Override public String name() { return "skills"; }
+        @Override public String desc() { return "列出 skills（/skills reload 强制重扫）"; }
+        @Override public SlashResult execute(String[] args, ReplSession s) {
+            var svc = s.bootstrap().skillService();
+            java.nio.file.Path root = s.workdir();
+            boolean reload = java.util.Arrays.stream(args).anyMatch(a -> "reload".equalsIgnoreCase(a));
+            if (reload) {
+                svc.refreshAll();
+            }
+            var cards = svc.snapshotFor(root);
+            var meta = svc.scanMeta(root);
+            StringBuilder sb = new StringBuilder();
+            sb.append(reload ? "已强制重扫。" : "")
+              .append("skills: ").append(cards.size())
+              .append(" · 热加载: ").append(svc.watcherRunning() ? "监视中" : "watcher 未运行").append('\n');
+            for (var c : cards) {
+                String d = c.description() == null ? "" : c.description();
+                sb.append("  ").append(c.name()).append(" — ")
+                  .append(d.length() > 80 ? d.substring(0, 80) + "…" : d).append('\n');
+            }
+            if (!meta.failed().isEmpty()) {
+                sb.append("扫描失败:\n");
+                meta.failed().forEach(f -> sb.append("  ⚠ ").append(f).append('\n'));
+            }
+            return SlashResult.handled(sb.toString().stripTrailing());
         }
     }
 
